@@ -1,10 +1,15 @@
 .DS_Store
+.env
+**/.env
 pipeline/.env
 pipeline/.venv/
 livekit/.venv/
 livekit/.env
+.venv/
 livekit/node_modules/
+node_modules/
 __pycache__/
 *.pyc
 private/
+logs/
 logs/*.jsonl

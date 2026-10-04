@@ -1,0 +1,7 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python livekit/talk_server.py"
+restartPolicyType = "ON_FAILURE"
