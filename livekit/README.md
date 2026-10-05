@@ -42,7 +42,7 @@ The browser shows:
 - Adjustable endpoint silence and speech sensitivity
 
 Language state changes only after an explicit request that names the target
-language, such as `Please speak Spanish` or `Switch back to English`. Multilingual
+language, such as `Please speak Spanish`, `Please speak Tamil`, or `Switch back to English`. Multilingual
 speech by itself does not change the configured response language.
 
 ## Local Defaults

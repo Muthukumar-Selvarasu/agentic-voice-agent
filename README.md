@@ -13,7 +13,7 @@ caller audio -> VAD and endpointing -> STT -> AgentRouter -> LLM -> RAG and tool
 - Hotel availability and mock booking tools
 - Hotel-only conversational guardrails
 - Local policy RAG using SQLite FTS5
-- English and Spanish session routing
+- English, Spanish, and Tamil session routing
 - Mock, OpenAI, and Groq provider modes
 - Local microphone capture with WebRTC VAD
 - Browser VAD with adaptive noise calibration and playback barge-in

@@ -375,7 +375,8 @@ async function sendAudioToAgent(audioBlob) {
       .join(" | ");
     addTranscript("agent", payload.reply, meta);
     providerEl.textContent = `Provider: ${payload.provider} | ${payload.model} | ${ttsMeta}`;
-    languageEl.textContent = payload.language === "es" ? "Spanish" : "English";
+    const languageLabels = { en: "English", es: "Spanish", ta: "Tamil" };
+    languageEl.textContent = languageLabels[payload.language] || "English";
     renderSources(payload.sources);
     renderTrace(payload.trace);
     agentBusy = false;

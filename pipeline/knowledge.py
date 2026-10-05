@@ -28,6 +28,16 @@ _QUERY_EXPANSIONS = {
     "accesibilidad": ["accessibility", "accessible"],
 }
 
+# Tamil is not indexed as Latin tokens. Map the phrase onto the English policy text.
+_SCRIPT_EXPANSIONS = (
+    ("ரத்து", ("cancellation", "cancelled")),
+    ("செல்லப்பிராணி", ("pets", "dogs")),
+    ("நாய்", ("pets", "dogs")),
+    ("பார்க்கிங்", ("parking")),
+    ("காலை உணவு", ("breakfast")),
+    ("செக் இன்", ("check-in",)),
+)
+
 
 def _normalized(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", value.lower())
@@ -83,6 +93,9 @@ class KnowledgeBase:
     def search(self, query: str, limit: int = 3) -> list[dict]:
         original_tokens = re.findall(r"[a-zA-Z0-9áéíóúüñ]+", query.lower())
         tokens = []
+        for marker, terms in _SCRIPT_EXPANSIONS:
+            if marker in query:
+                tokens.extend(terms)
         for token in original_tokens:
             if token in _STOP_WORDS:
                 continue

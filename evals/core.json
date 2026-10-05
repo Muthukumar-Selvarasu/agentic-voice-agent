@@ -99,6 +99,41 @@
     ]
   },
   {
+    "id": "router.language_tamil",
+    "description": "The same session can switch to Tamil, and a courtesy does not switch it away.",
+    "turns": [
+      {
+        "user": "Please speak Tamil.",
+        "expect": {
+          "language": "ta",
+          "tools": ["set_language"]
+        }
+      },
+      {
+        "user": "ரத்து கொள்கை என்ன?",
+        "expect": {
+          "language": "ta",
+          "tools": ["search_hotel_knowledge"],
+          "sourceContains": "hotel_policies.md#Cancellation"
+        }
+      },
+      {
+        "user": "நன்றி",
+        "expect": {
+          "language": "ta",
+          "tools": []
+        }
+      },
+      {
+        "user": "Switch back to English.",
+        "expect": {
+          "language": "en",
+          "tools": ["set_language"]
+        }
+      }
+    ]
+  },
+  {
     "id": "control.transfer",
     "description": "A human request produces the transfer control action.",
     "turns": [

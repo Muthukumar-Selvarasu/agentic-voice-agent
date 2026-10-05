@@ -8,6 +8,7 @@ from dataclasses import dataclass
 LANGUAGES = {
     "en": {"name": "English", "locale": "en-US"},
     "es": {"name": "Spanish", "locale": "es-ES"},
+    "ta": {"name": "Tamil", "locale": "ta-IN"},
 }
 
 

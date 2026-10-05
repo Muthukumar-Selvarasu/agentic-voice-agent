@@ -41,10 +41,10 @@ Guardrails:
   in-scope question before returning to missing booking details.
 - Keep replies short and spoken-friendly: one or two sentences, no bullet lists,
   no markdown, no emoji.
-- When the caller asks to speak, continue, switch, or switch back in a supported
-  language, call set_language immediately. Do not change language merely because
-  the caller uses a short word or courtesy phrase from another language. After
-  the tool result, answer in the selected language.
+- When the caller asks to speak, continue, switch, or switch back in English,
+  Spanish, or Tamil, call set_language immediately. Do not change language merely
+  because the caller uses a short word or courtesy phrase from another language.
+  After the tool result, answer in the selected language.
 
 Booking flow:
 1. First collect only check-in date, check-out date, guest count, and optional
@@ -66,15 +66,15 @@ TOOLS = [
         "function": {
             "name": "set_language",
             "description": "Set the response language for this call when the caller asks to speak, "
-                           "continue, switch, or switch back in English or Spanish. Only call for an "
+                           "continue, switch, or switch back in English, Spanish, or Tamil. Only call for an "
                            "explicit language-change request, not an isolated foreign word or courtesy.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "language": {
                         "type": "string",
-                        "enum": ["en", "es"],
-                        "description": "Requested response language: en for English or es for Spanish.",
+                        "enum": ["en", "es", "ta"],
+                        "description": "Requested response language: en for English, es for Spanish, or ta for Tamil.",
                     },
                 },
                 "required": ["language"],
@@ -185,6 +185,7 @@ _KNOWLEDGE_INTENT_PHRASES = (
     "check out", "accessibility", "accessible room", "wi-fi", "wifi", "amenities",
     "política de cancelación", "politica de cancelacion", "mascotas",
     "estacionamiento", "desayuno", "accesibilidad",
+    "ரத்து", "செல்லப்பிராணி", "பார்க்கிங்", "காலை உணவு", "செக் இன்",
 )
 
 _FUZZY_AMENITY_TERMS = (
@@ -195,6 +196,12 @@ _FUZZY_AMENITY_TERMS = (
 _LANGUAGE_NAMES = {
     "en": {"english", "ingles"},
     "es": {"spanish", "espanol"},
+    "ta": {"tamil", "tamizh"},
+}
+
+# Tamil script is removed by Latin tokenization, so match these in the raw utterance.
+_LANGUAGE_MARKERS = {
+    "ta": ("தமிழ",),
 }
 
 
@@ -217,6 +224,8 @@ def _has_fuzzy_term(tokens: list[str], terms: tuple[str, ...], cutoff: float = 0
 
 def explicit_language_request(text: str, language: str) -> bool:
     """Require the target language name before allowing a session-state change."""
+    if any(marker in text for marker in _LANGUAGE_MARKERS.get(language, ())):
+        return True
     return bool(set(_normalized_tokens(text)) & _LANGUAGE_NAMES.get(language, set()))
 
 

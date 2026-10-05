@@ -187,7 +187,8 @@ class MockProvider:
     def chat(self, messages: list[dict], tools=None, tool_choice=None):
         """Rule-based reply mimicking OpenAI-style tool calling."""
         last = messages[-1]
-        spanish = "Current response language: Spanish" in messages[0].get("content", "")
+        language = _session_language(messages)
+        spanish = language == "es"
         forced_tool = _tool_choice_name(tool_choice)
         if forced_tool == "search_hotel_knowledge" and last.get("role") == "user":
             return _mk_tool(forced_tool, {"query": last.get("content") or ""})
@@ -201,6 +202,13 @@ class MockProvider:
                 if _mock_off_topic(original):
                     return _mk_text("Solo puedo ayudar con reservas de hotel. ¿Quiere reservar, cambiar o cancelar una estancia?")
                 return _mk_text("Claro. Puedo ayudarle con una reserva en Aurora Hotel.")
+            if result.lower().startswith("response language set to tamil"):
+                original = _last_user_text(messages).lower()
+                if _mock_knowledge_request(original):
+                    return _mk_tool("search_hotel_knowledge", {"query": original})
+                if _mock_off_topic(original):
+                    return _mk_text("ஹோட்டல் முன்பதிவுக்கு மட்டுமே உதவ முடியும். அறை பதிவு செய்ய வேண்டுமா?")
+                return _mk_text("சரி. அரோரா ஹோட்டல் முன்பதிவில் உதவ முடியும்.")
             if result.lower().startswith("response language set to english"):
                 original = _last_user_text(messages).lower()
                 if _mock_knowledge_request(original):
@@ -220,7 +228,7 @@ class MockProvider:
                 return _mk_text(result)
             if result.lower().startswith("grounded hotel knowledge"):
                 tool_args = _previous_tool_arguments(messages)
-                return _mk_text(_grounded_policy_reply(result, spanish, tool_args.get("query", "")))
+                return _mk_text(_grounded_policy_reply(result, language, tool_args.get("query", "")))
             if result.lower().startswith("transferring") and spanish:
                 return _mk_text("Le transfiero a la recepción.")
             if result.lower().startswith("ending") and spanish:
@@ -240,6 +248,10 @@ class MockProvider:
             "habla inglés", "hable inglés", "en inglés", "habla ingles",
         )):
             return _mk_tool("set_language", {"language": "en"})
+        if any(phrase in text for phrase in (
+            "speak tamil", "switch to tamil", "tamil please", "in tamil", "தமிழ",
+        )):
+            return _mk_tool("set_language", {"language": "ta"})
         if _mock_knowledge_request(text):
             return _mk_tool("search_hotel_knowledge", {"query": last.get("content") or ""})
         if any(w in text for w in ("bye", "goodbye", "that's all", "thats all",
@@ -282,6 +294,8 @@ class MockProvider:
             })
         if spanish:
             return _mk_text("Solo puedo ayudar con reservas de hotel. ¿Quiere reservar, cambiar o cancelar una estancia?")
+        if language == "ta":
+            return _mk_text("ஹோட்டல் முன்பதிவுக்கு மட்டுமே உதவ முடியும். அறை பதிவு செய்ய வேண்டுமா?")
         return _mk_text("I can help with hotel reservations only. Would you like to book, change, or cancel a stay?")
 
     def transcribe(self, pcm_int16: bytes, sample_rate: int = 16000) -> str:
@@ -326,6 +340,7 @@ def _mock_knowledge_request(text: str) -> bool:
         "cancellation policy", "cancel policy", "check-in", "check in", "check-out",
         "check out", "parking", "pets", "pet policy", "breakfast", "accessible",
         "accessibility", "policy", "estacionamiento", "mascotas", "desayuno",
+        "ரத்து", "செல்லப்பிராணி", "பார்க்கிங்", "காலை உணவு", "செக் இன்",
     ))
 
 
@@ -347,26 +362,45 @@ def _previous_tool_arguments(messages: list[dict]) -> dict:
         return {}
 
 
-def _grounded_policy_reply(result: str, spanish: bool, query: str) -> str:
+def _session_language(messages: list[dict]) -> str:
+    content = messages[0].get("content", "") if messages else ""
+    if "Current response language: Spanish" in content:
+        return "es"
+    if "Current response language: Tamil" in content:
+        return "ta"
+    return "en"
+
+
+def _grounded_policy_reply(result: str, language: str, query: str) -> str:
     topic = query.lower()
-    if "cancel" in topic:
-        if spanish:
+    if "cancel" in topic or "ரத்து" in topic:
+        if language == "es":
             return "Puede cancelar sin cargo hasta las 6:00 PM, hora local del hotel, dos días antes de la llegada. Las tarifas promocionales prepagadas no son reembolsables."
+        if language == "ta":
+            return "வருகைக்கு இரண்டு நாட்களுக்கு முன்பு, உள்ளூர் நேரம் மாலை 6 மணி வரை கட்டணமின்றி ரத்து செய்யலாம். முன்பண விளம்பர கட்டணங்கள் திரும்ப வராது."
         return "You may cancel without charge until 6:00 PM local hotel time two days before arrival. Prepaid promotional rates are non-refundable."
-    if "parking" in topic or "estacionamiento" in topic:
-        if spanish:
+    if "parking" in topic or "estacionamiento" in topic or "பார்க்கிங்" in topic:
+        if language == "es":
             return "El estacionamiento cuesta $28 por noche y el servicio de valet cuesta $42 por noche."
+        if language == "ta":
+            return "சுய பார்க்கிங் இரவுக்கு $28. வேலட் பார்க்கிங் இரவுக்கு $42."
         return "Self-parking is $28 per night, and valet parking is $42 per night."
-    if "pet" in topic or "dog" in topic or "mascota" in topic:
-        if spanish:
+    if "pet" in topic or "dog" in topic or "mascota" in topic or "செல்லப்பிராணி" in topic:
+        if language == "es":
             return "Se permiten hasta dos perros por habitación, con un límite de 50 libras por perro y una tarifa de limpieza de $75 por estancia."
+        if language == "ta":
+            return "ஒரு அறைக்கு இரண்டு நாய்கள் வரை அனுமதி. ஒரு நாய்க்கு 50 பவுண்டு வரம்பு. தங்கும் முழு நேரத்திற்கும் $75 சுத்தம் கட்டணம்."
         return "Up to two dogs are allowed per room, with a 50-pound limit per dog and a $75 cleaning fee per stay."
-    if "breakfast" in topic or "desayuno" in topic:
-        if spanish:
+    if "breakfast" in topic or "desayuno" in topic or "காலை உணவு" in topic:
+        if language == "es":
             return "El desayuno se sirve de 6:30 AM a 10:30 AM y solo está incluido cuando la tarifa lo indica."
+        if language == "ta":
+            return "காலை உணவு காலை 6:30 முதல் 10:30 வரை. தேர்ந்தெடுத்த கட்டணத்தில் சேர்க்கப்பட்டால் மட்டுமே இலவசம்."
         return "Breakfast is served from 6:30 AM to 10:30 AM and is included only when the selected rate says so."
-    if spanish:
+    if language == "es":
         return "Encontré la política de Aurora Hotel y puedo ayudarle con los detalles de su reserva."
+    if language == "ta":
+        return "அரோரா ஹோட்டல் கொள்கையை கண்டேன். முன்பதிவு விவரங்களுக்கு உதவ முடியும்."
     return "I found the relevant Aurora Hotel policy and can help apply it to your reservation."
 
 

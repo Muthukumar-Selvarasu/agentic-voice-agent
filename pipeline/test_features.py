@@ -22,6 +22,7 @@ class RouterTests(unittest.TestCase):
         router = AgentRouter()
         self.assertEqual(router.set_language("es").language, "es")
         self.assertEqual(router.route().language, "es")
+        self.assertEqual(router.set_language("ta").locale, "ta-IN")
         self.assertEqual(router.set_language("en").language, "en")
 
     def test_language_switch_intent_uses_control_tool(self):
@@ -47,7 +48,10 @@ class RouterTests(unittest.TestCase):
     def test_language_change_requires_explicit_target_name(self):
         self.assertTrue(explicit_language_request("Switch back to English", "en"))
         self.assertTrue(explicit_language_request("Por favor, habla español", "es"))
+        self.assertTrue(explicit_language_request("Please speak Tamil", "ta"))
+        self.assertTrue(explicit_language_request("தமிழில் பேசுங்கள்", "ta"))
         self.assertFalse(explicit_language_request("¡Gracias!", "es"))
+        self.assertFalse(explicit_language_request("நன்றி", "ta"))
 
     def test_overeager_language_tool_cannot_change_state(self):
         class OvereagerProvider(MockProvider):
@@ -89,6 +93,10 @@ class RetrievalTests(unittest.TestCase):
     def test_spanish_query_expands_to_english_knowledge(self):
         result = search_hotel_knowledge("¿Cuál es la política de mascotas?")
         self.assertEqual(result["sources"], ["hotel_policies.md#Pets"])
+
+    def test_tamil_cancellation_query_expands_to_english_knowledge(self):
+        result = search_hotel_knowledge("ரத்து கொள்கை என்ன?")
+        self.assertEqual(result["sources"], ["hotel_policies.md#Cancellation"])
 
     def test_policy_intent_requires_grounding_tool(self):
         self.assertEqual(

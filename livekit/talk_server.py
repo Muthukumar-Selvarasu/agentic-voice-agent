@@ -319,7 +319,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "livekitRoom": _livekit_room(),
                 "livekitUrl": _livekit_url(),
                 "agentProvider": _agent_provider_name(),
-                "languages": ["en", "es"],
+                "languages": ["en", "es", "ta"],
             })
         if parsed.path != "/token":
             return super().do_GET()
