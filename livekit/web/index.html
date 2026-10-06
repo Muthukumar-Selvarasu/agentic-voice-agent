@@ -69,9 +69,9 @@
           <li>நன்றி — badge must stay Tamil.</li>
           <li>Switch back to English.</li>
           <li>What time is check-in?</li>
-          <li>FDE-228: endpoint 350 → mid-sentence pause; then 900 → same sentence; restore 650.</li>
-          <li>Ask cancellation; ~0.5s into reply say “Wait, speak Tamil.” (or Interrupt / Space).</li>
-          <li>Ask one more Tamil question. Confirm Runtime: barge_in.candidate → barge_in.detected.</li>
+          <li>FDE-228: endpoint 350 (mid-pause can cut) → 900 (keeps pause) → restore 650; then barge with “Wait, speak Tamil.”</li>
+          <li>Ask cancellation; ~0.5s into reply say “Wait, speak Tamil.” (or Interrupt / Space). Confirm Runtime: barge_in.candidate → barge_in.detected.</li>
+          <li>Ask one more Tamil question on the same call.</li>
         </ol>
         <p class="verify-note">
           Hard-reload before Start call. Pause for each reply. Do not book or transfer.

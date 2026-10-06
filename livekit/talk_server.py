@@ -261,9 +261,12 @@ def _voice_agent_reply(
                 stt = agent.provider.client.audio.transcriptions.create(**transcription_args)
             transcript = (stt if isinstance(stt, str) else stt.text).strip()
         # Speaker bleed often arrives as a normal turn right after TTS ends, not
-        # only as an X-Barge-In interrupt. Suppress either path when it matches.
+        # only as an X-Barge-In interrupt. Suppress only clear playback copies —
+        # never drop a deliberate barge-in / courtesy like "நன்றி".
         if (was_barge_in or after_playback) and _is_probable_playback_echo(
-            transcript, _last_spoken_text(session_id)
+            transcript,
+            _last_spoken_text(session_id),
+            barge_in=was_barge_in,
         ):
             trace.event(
                 "barge_in.echo_suppressed",
@@ -305,89 +308,74 @@ def _normalize_utterance(text: str) -> str:
     return " ".join(stripped.split())
 
 
-_ECHO_NOISE_OR_COURTESY = {
-    "all right",
-    "alright",
-    "thanks",
-    "thank you",
-    "thank you so much",
-    "thanks a lot",
-    "thank you very much",
+# Whisper / browser-TTS hallucinations only — not real caller courtesies.
+_ECHO_HALLUCINATIONS = {
     "thank you for watching",
     "thanks for watching",
-    "youre welcome",
-    "your welcome",
-    "welcome",
-    "okay",
-    "ok",
-    "bye",
-    "goodbye",
-    "good bye",
-    "have a good day",
-    "have a great day",
-    "see you next time",
-    "see you later",
-    "nandri",
-    "gracias",
-    "de nada",
     "subtitles by",
     "amara org",
     "amara",
-    "you",
-    "the",
-    "yeah",
-    "yes",
-    "no",
-    "uh",
-    "um",
-    "ah",
-    "oh",
+    "see you next time",
 }
 
 
-def _is_probable_playback_echo(transcript: str, spoken: str = "") -> bool:
+def _is_probable_playback_echo(
+    transcript: str,
+    spoken: str = "",
+    *,
+    barge_in: bool = False,
+) -> bool:
     """Ignore audio that is only Aurora's own speaker playback coming back.
 
-    A real interruption such as "Wait, speak Tamil" is kept. A short fragment
-    of the line Aurora just spoke, near-duplicate STT of that line, or a bare
-    courtesy/hallucination, is treated as echo.
+    A real interruption such as "Wait, speak Tamil" or a courtesy "நன்றி" is kept.
+    Near-duplicate STT of the line Aurora just spoke is treated as echo.
     """
     normalized = _normalize_utterance(transcript)
     if not normalized:
         return True
-    if len(normalized) <= 2:
+    if len(normalized) <= 1:
         return True
-    if normalized in _ECHO_NOISE_OR_COURTESY:
-        return True
-    if any(h in normalized for h in ("watching", "subtitles by", "amara.org", "amara org")):
-        return True
+
+    # Never treat deliberate barge-ins as hallucination noise.
+    if not barge_in:
+        if normalized in _ECHO_HALLUCINATIONS:
+            return True
+        if any(h in normalized for h in ("watching", "subtitles by", "amara.org", "amara org")):
+            return True
 
     spoken_norm = _normalize_utterance(spoken)
     if not spoken_norm:
         return False
-    if normalized in spoken_norm:
+
+    # Exact / near copy of the full reply (true speaker echo).
+    if SequenceMatcher(None, normalized, spoken_norm).ratio() >= (0.88 if barge_in else 0.78):
         return True
 
-    # STT of speaker echo often returns a near-copy of the last reply.
-    if SequenceMatcher(None, normalized, spoken_norm).ratio() >= 0.72:
+    # Contiguous fragment of the reply (avoid single shared topic words).
+    if len(normalized) >= 8 and normalized in spoken_norm:
         return True
 
-    # Token overlap: short echo fragments whose words are almost entirely from what was just spoken
     t_words = [w for w in normalized.split() if len(w) > 1]
     s_words = set(spoken_norm.split())
-    if t_words and len(t_words) <= 8 and s_words:
+    if t_words and s_words and len(t_words) <= 10:
         matching = sum(1 for w in t_words if w in s_words)
-        if matching / len(t_words) >= 0.6:
+        # Barge-in needs almost all tokens from the reply; topic words alone must not drop.
+        overlap = matching / len(t_words)
+        if barge_in:
+            if len(t_words) >= 4 and overlap >= 0.9:
+                return True
+        elif len(t_words) <= 6 and overlap >= 0.85:
             return True
 
-    # Compare against each sentence of the last reply.
     for piece in spoken_norm.replace("?", ".").split("."):
         piece = piece.strip()
-        if len(piece) >= 8 and (
-            normalized in piece
-            or piece in normalized
-            or SequenceMatcher(None, normalized, piece).ratio() >= 0.78
-        ):
+        if len(piece) < 16:
+            continue
+        ratio = SequenceMatcher(None, normalized, piece).ratio()
+        if barge_in:
+            if ratio >= 0.9 or (len(normalized) >= 16 and normalized in piece):
+                return True
+        elif normalized in piece or piece in normalized or ratio >= 0.85:
             return True
     return False
 

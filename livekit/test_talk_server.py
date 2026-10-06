@@ -110,9 +110,11 @@ class PlaybackEchoTests(unittest.TestCase):
     def test_whisper_hallucination_is_echo(self):
         spoken = "Thanks for calling Aurora Hotel reservations. How can I help?"
         self.assertTrue(_is_probable_playback_echo("Thank you for watching.", spoken))
-        self.assertTrue(_is_probable_playback_echo("Goodbye", spoken))
-        self.assertTrue(_is_probable_playback_echo("Bye", spoken))
         self.assertTrue(_is_probable_playback_echo("Subtitles by the Amara.org community", spoken))
+        # Real caller closings / courtesies must not be dropped as echo.
+        self.assertFalse(_is_probable_playback_echo("Goodbye", spoken))
+        self.assertFalse(_is_probable_playback_echo("நன்றி", spoken))
+        self.assertFalse(_is_probable_playback_echo("nandri", spoken))
 
     def test_token_overlap_fragment_is_echo(self):
         spoken = "We have a Standard Queen for $189 per night and a Deluxe King for $229. Which would you like?"
@@ -122,6 +124,18 @@ class PlaybackEchoTests(unittest.TestCase):
     def test_tamil_real_interruption_is_kept(self):
         spoken = "அரோரா ஹோட்டல் முன்பதிவில் உதவ முடியும்."
         self.assertFalse(_is_probable_playback_echo("ரத்து கொள்கை என்ன?", spoken))
+
+    def test_barge_in_keeps_topic_followups(self):
+        spoken = (
+            "You may cancel without charge until 6:00 PM local hotel time "
+            "two days before arrival."
+        )
+        self.assertFalse(
+            _is_probable_playback_echo("Wait, speak Tamil.", spoken, barge_in=True)
+        )
+        self.assertFalse(
+            _is_probable_playback_echo("What about cancellation?", spoken, barge_in=True)
+        )
 
 
 class StaticCacheTests(unittest.TestCase):

@@ -5,6 +5,7 @@ const agentRoot = document.querySelector('[data-client="agent"]');
 const callerStatus = callerRoot.querySelector('[data-role="status"]');
 const agentStatus = agentRoot.querySelector('[data-role="status"]');
 const startButton = document.querySelector("#start-call");
+const interruptButton = document.querySelector("#interrupt-call");
 const muteButton = document.querySelector("#mute-call");
 const endButton = document.querySelector("#end-call");
 const participantsEl = document.querySelector("#participants");
@@ -78,39 +79,56 @@ const tuning = {
   sensitivity: 3.2,
   minTurnMs: 450,
   speechConfirmationMs: 140,
-  bargeInConfirmationMs: 220,
-  bargeInArmMs: 250,
-  bargeEchoMultiple: 1.5,
-  postPlaybackHoldMs: 350,
+  bargeInConfirmationMs: 280,
+  bargeInArmMs: 350,
+  bargeEchoMultiple: 2.2,
+  postPlaybackHoldMs: 700,
   afterPlaybackEchoMs: 2000,
+  playbackVolume: 0.55,
   maxTurnMs: 25000,
 };
 
 function applyAudioMode(mode) {
   audioMode = mode;
   if (mode === "speaker") {
-    tuning.speechConfirmationMs = 180;
-    tuning.bargeInConfirmationMs = 600;
-    tuning.bargeInArmMs = 850;
-    tuning.postPlaybackHoldMs = 1400;
-    tuning.bargeEchoMultiple = 3.8;
+    // Soft TTS + floor-relative barge so a normal voice can cut in on speakers.
+    tuning.speechConfirmationMs = 140;
+    tuning.bargeInConfirmationMs = 180;
+    tuning.bargeInArmMs = 220;
+    tuning.postPlaybackHoldMs = 650;
+    tuning.afterPlaybackEchoMs = 1800;
+    tuning.bargeEchoMultiple = 1.55;
+    tuning.playbackVolume = 0.32;
     if (audioModeValue) audioModeValue.textContent = "Laptop Speaker";
   } else {
-    tuning.speechConfirmationMs = 120;
-    tuning.bargeInConfirmationMs = 420;
-    tuning.bargeInArmMs = 650;
-    tuning.postPlaybackHoldMs = 700;
-    tuning.bargeEchoMultiple = 2.4;
+    tuning.speechConfirmationMs = 110;
+    tuning.bargeInConfirmationMs = 160;
+    tuning.bargeInArmMs = 120;
+    tuning.postPlaybackHoldMs = 220;
+    tuning.afterPlaybackEchoMs = 800;
+    tuning.bargeEchoMultiple = 1.45;
+    tuning.playbackVolume = 1;
     if (audioModeValue) audioModeValue.textContent = "Headset";
   }
+  if (activeAgentAudio) activeAgentAudio.volume = tuning.playbackVolume;
 }
 
 function setCallControls(connected) {
   startButton.disabled = connected;
   muteButton.disabled = !connected;
   endButton.disabled = !connected;
+  if (interruptButton) {
+    interruptButton.disabled = !connected || !agentSpeaking;
+    interruptButton.classList.toggle("interrupt-ready", connected && agentSpeaking);
+  }
   callerRoot.classList.toggle("connected", connected);
   agentRoot.classList.toggle("connected", connected);
+}
+
+function setInterruptEnabled(enabled) {
+  if (!interruptButton) return;
+  interruptButton.disabled = !listenStream || !enabled;
+  interruptButton.classList.toggle("interrupt-ready", Boolean(listenStream && enabled));
 }
 
 function setListeningState(state, detail) {
@@ -225,7 +243,10 @@ function chooseVoice(locale) {
 
 function stopAgentPlayback() {
   playbackToken += 1;
-  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+  if ("speechSynthesis" in window) {
+    try { window.speechSynthesis.resume(); } catch { /* ignore */ }
+    window.speechSynthesis.cancel();
+  }
   if (activeAgentAudio) {
     activeAgentAudio.onplay = null;
     activeAgentAudio.onended = null;
@@ -240,6 +261,7 @@ function beginAgentPlayback(token, backend) {
   if (token !== playbackToken) return;
   agentSpeaking = true;
   agentRoot.classList.add("speaking");
+  setInterruptEnabled(true);
   playbackStartedAt = Date.now();
   playbackEchoFloor = Math.max(noiseFloor, 0.012);
   playbackEchoPeak = Math.max(smoothedLevel, 0.02);
@@ -247,6 +269,7 @@ function beginAgentPlayback(token, backend) {
   bargeCandidateAt = 0;
   bargeRecordingCandidate = false;
   if (recorder) stopTurnRecording(true);
+  if (activeAgentAudio) activeAgentAudio.volume = tuning.playbackVolume;
   pipelineEl.querySelector('[data-stage="tts"]')?.classList.add("complete");
   appendRuntimeEvent(`tts.playback_started | ${backend}`);
   if (lastEndpointAt) {
@@ -255,7 +278,12 @@ function beginAgentPlayback(token, backend) {
     appendRuntimeEvent(`turn.first_audio | ${formatMs(firstAudioMs)}`);
     lastEndpointAt = 0;
   }
-  setListeningState("Agent speaking", "Interrupt naturally by speaking over Aurora.");
+  setListeningState(
+    "Agent speaking",
+    audioMode === "speaker"
+      ? "Speak now to interrupt, or click Interrupt / press Space."
+      : "Speak over Aurora to interrupt.",
+  );
 }
 
 function finishAgentPlayback(token) {
@@ -263,6 +291,7 @@ function finishAgentPlayback(token) {
   activeAgentAudio = null;
   agentSpeaking = false;
   agentRoot.classList.remove("speaking");
+  setInterruptEnabled(false);
   playbackEndedAt = Date.now();
   // Hold off listening until speaker reverb decays; stops self-turns after TTS.
   listenCooldownUntil = playbackEndedAt + tuning.postPlaybackHoldMs;
@@ -282,6 +311,7 @@ function speakWithBrowserVoice(text, locale, token) {
   utterance.lang = locale;
   utterance.rate = 0.98;
   utterance.pitch = 1.0;
+  utterance.volume = tuning.playbackVolume;
   const voice = chooseVoice(locale);
   if (voice) utterance.voice = voice;
 
@@ -300,6 +330,7 @@ function speak(text, locale = "en-US", audioBase64 = "", audioContentType = "aud
   }
 
   const audio = new Audio(`data:${audioContentType};base64,${audioBase64}`);
+  audio.volume = tuning.playbackVolume;
   activeAgentAudio = audio;
   let fellBack = false;
   const fallback = () => {
@@ -315,11 +346,23 @@ function speak(text, locale = "en-US", audioBase64 = "", audioContentType = "aud
   audio.play().catch(fallback);
 }
 
+function forceInterrupt() {
+  if (!listenStream || (!agentSpeaking && !agentBusy)) return;
+  const detectedAt = Date.now();
+  appendRuntimeEvent("barge_in.manual");
+  if (agentSpeaking) {
+    interruptAgent(detectedAt, false);
+    startTurnRecording(true);
+    lastSpeechAt = detectedAt;
+  }
+}
+
 function interruptAgent(detectedAt, turnAlreadyRecording = false) {
   if (!agentSpeaking) return;
   stopAgentPlayback();
   agentSpeaking = false;
   agentRoot.classList.remove("speaking");
+  setInterruptEnabled(false);
   playbackEndedAt = Date.now();
   listenCooldownUntil = Date.now() + 80;
   pendingBargeInTurn = !turnAlreadyRecording;
@@ -346,11 +389,10 @@ function audioLevel() {
 function thresholds() {
   const start = Math.min(0.09, Math.max(0.012, noiseFloor * tuning.sensitivity));
   if (audioMode === "speaker") {
-    const barge = Math.max(
-      0.15,
-      start * 3.0,
-      playbackEchoPeak * 1.5 + 0.04,
-      playbackEchoFloor * tuning.bargeEchoMultiple,
+    // Gate on echo floor only — tracking peak made barge impossible while TTS played.
+    const barge = Math.min(
+      0.085,
+      Math.max(0.04, start * 1.7, playbackEchoFloor * tuning.bargeEchoMultiple),
     );
     return {
       start,
@@ -360,14 +402,35 @@ function thresholds() {
   }
 
   const barge = Math.min(
-    0.20,
-    Math.max(0.045, start * 2.1, playbackEchoFloor * tuning.bargeEchoMultiple),
+    0.09,
+    Math.max(0.03, start * 1.5, playbackEchoFloor * tuning.bargeEchoMultiple),
   );
   return {
     start,
-    end: Math.max(0.008, start * 0.58),
+    end: Math.max(0.008, start * 0.55),
     barge,
   };
+}
+
+function duckAgentPlayback() {
+  if (activeAgentAudio) {
+    activeAgentAudio.volume = Math.min(tuning.playbackVolume, 0.12);
+    return;
+  }
+  // Browser TTS cannot change volume mid-utterance; pause is the duck.
+  if ("speechSynthesis" in window && window.speechSynthesis.speaking) {
+    try { window.speechSynthesis.pause(); } catch { /* ignore */ }
+  }
+}
+
+function restoreAgentPlaybackVolume() {
+  if (activeAgentAudio) {
+    activeAgentAudio.volume = tuning.playbackVolume;
+    return;
+  }
+  if ("speechSynthesis" in window && window.speechSynthesis.paused) {
+    try { window.speechSynthesis.resume(); } catch { /* ignore */ }
+  }
 }
 
 function startTurnRecording(isBargeIn = false) {
@@ -556,19 +619,34 @@ function vadLoop() {
 
   if (agentSpeaking && !muted) {
     const playbackAge = now - playbackStartedAt;
-    // Track speaker bleed into the mic: both moving floor and peak envelope
-    playbackEchoFloor = (playbackEchoFloor * 0.85) + (smoothedLevel * 0.15);
-    playbackEchoPeak = Math.max(playbackEchoPeak * 0.96, smoothedLevel);
+    if (audioMode === "speaker") {
+      // Learn steady speaker echo; do not let peaks raise the barge gate.
+      if (!bargeCandidateAt && smoothedLevel < limit.barge * 0.9) {
+        playbackEchoFloor = (playbackEchoFloor * 0.88) + (smoothedLevel * 0.12);
+        playbackEchoPeak = Math.max(playbackEchoPeak * 0.94, smoothedLevel);
+      } else {
+        playbackEchoPeak *= 0.98;
+      }
+    } else if (!bargeCandidateAt && smoothedLevel < limit.barge * 0.9) {
+      playbackEchoFloor = (playbackEchoFloor * 0.9) + (smoothedLevel * 0.1);
+      playbackEchoPeak = Math.max(playbackEchoPeak * 0.96, smoothedLevel);
+    } else {
+      playbackEchoPeak *= 0.98;
+    }
+    const liveLimit = thresholds();
+    // Relative spike over the learned floor (works when TTS and voice overlap).
+    const relativeSpike = smoothedLevel > playbackEchoFloor * 1.45 + 0.012;
+    const bargeHit = smoothedLevel > liveLimit.barge || (audioMode === "speaker" && relativeSpike);
     if (playbackAge < tuning.bargeInArmMs) {
       bargeCandidateAt = 0;
       bargeRecordingCandidate = false;
-    } else if (smoothedLevel > limit.barge) {
+    } else if (bargeHit) {
       if (!bargeCandidateAt) {
         bargeCandidateAt = now;
         bargeRecordingCandidate = true;
         appendRuntimeEvent("barge_in.candidate");
+        duckAgentPlayback();
       }
-      // Only interrupt + record after sustained loud speech above speaker volume
       if (now - bargeCandidateAt >= tuning.bargeInConfirmationMs) {
         bargeRecordingCandidate = false;
         interruptAgent(bargeCandidateAt, false);
@@ -580,13 +658,17 @@ function vadLoop() {
       if (bargeRecordingCandidate) {
         bargeRecordingCandidate = false;
         appendRuntimeEvent("barge_in.candidate_dropped");
+        restoreAgentPlaybackVolume();
       }
       bargeCandidateAt = 0;
     }
   } else if (!agentBusy && !muted) {
     if (now <= listenCooldownUntil) {
-      // During post-playback cooldown, adapt noise floor to real room ambient level
-      if (smoothedLevel < limit.start * 1.5) {
+      if (audioMode === "headset" && smoothedLevel > limit.start * 1.4) {
+        // Headphones: allow speaking through a short post-playback hold.
+        listenCooldownUntil = 0;
+        speechCandidateAt = speechCandidateAt || now;
+      } else if (smoothedLevel < limit.start * 1.5) {
         noiseFloor = (noiseFloor * 0.95) + (rawLevel * 0.05);
       }
     } else if (!recorder) {
@@ -663,9 +745,10 @@ function renderParticipants() {
 async function prepareListener() {
   listenStream = await navigator.mediaDevices.getUserMedia({
     audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
+      echoCancellation: { ideal: true },
+      noiseSuppression: { ideal: true },
+      autoGainControl: { ideal: true },
+      voiceIsolation: { ideal: true },
       channelCount: 1,
     },
   });
@@ -796,11 +879,68 @@ startButton.addEventListener("click", () => {
     await endCall();
   });
 });
+interruptButton?.addEventListener("click", () => forceInterrupt());
+document.addEventListener("keydown", (event) => {
+  if (event.code !== "Space" || event.repeat) return;
+  const tag = (event.target && event.target.tagName) || "";
+  if (tag === "INPUT" || tag === "TEXTAREA" || event.target?.isContentEditable) return;
+  if (!agentSpeaking) return;
+  event.preventDefault();
+  forceInterrupt();
+});
 muteButton.addEventListener("click", () => toggleMute().catch((error) => {
   setListeningState("Mute failed", error.message);
 }));
 endButton.addEventListener("click", () => endCall());
 
 setCallControls(false);
-applyAudioMode("speaker");
+applyAudioMode(audioModeControl?.value || "speaker");
 loadState();
+
+/** Workshop/demo hooks for endpoint silence checks (FDE-228). */
+window.__auroraTalk = {
+  sessionId: () => sessionId,
+  endpointMs: () => tuning.endpointSilenceMs,
+  setEndpoint(ms) {
+    if (!endpointControl) return tuning.endpointSilenceMs;
+    endpointControl.value = String(ms);
+    endpointControl.dispatchEvent(new Event("input", { bubbles: true }));
+    return tuning.endpointSilenceMs;
+  },
+  clientEvents: () => [...clientEvents],
+  state: () => ({
+    listening: listeningStateEl?.textContent || "",
+    muted,
+    agentSpeaking,
+    agentBusy,
+    endpointMs: tuning.endpointSilenceMs,
+    noiseFloor,
+    trigger: thresholds().start,
+  }),
+  async injectSpeechBursts({ burstMs = 420, gapMs = 500, level = 0.22 } = {}) {
+    if (!audioContext || !analyser) throw new Error("Call is not listening yet.");
+    const osc = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+    osc.type = "sawtooth";
+    osc.frequency.value = 210;
+    gain.gain.value = 0;
+    osc.connect(gain);
+    gain.connect(analyser);
+    osc.start();
+    const t0 = audioContext.currentTime;
+    const b = burstMs / 1000;
+    const g = gapMs / 1000;
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(level, t0 + 0.02);
+    gain.gain.setValueAtTime(level, t0 + b);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + b + 0.03);
+    gain.gain.setValueAtTime(0.0001, t0 + b + g);
+    gain.gain.exponentialRampToValueAtTime(level, t0 + b + g + 0.02);
+    gain.gain.setValueAtTime(level, t0 + 2 * b + g);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 2 * b + g + 0.03);
+    await new Promise((resolve) => setTimeout(resolve, burstMs * 2 + gapMs + 80));
+    try { osc.stop(); } catch { /* ignore */ }
+    osc.disconnect();
+    gain.disconnect();
+  },
+};
