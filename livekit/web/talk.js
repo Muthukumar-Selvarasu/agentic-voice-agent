@@ -319,6 +319,8 @@ function speakWithBrowserVoice(text, locale, token) {
   utterance.onend = () => finishAgentPlayback(token);
   utterance.onerror = () => finishAgentPlayback(token);
   window.speechSynthesis.speak(utterance);
+  // Some Chromium embeds never fire onstart; arm barge-in from the speak() call.
+  if (!agentSpeaking) beginAgentPlayback(token, "browser");
 }
 
 function speak(text, locale = "en-US", audioBase64 = "", audioContentType = "audio/wav") {
@@ -347,7 +349,14 @@ function speak(text, locale = "en-US", audioBase64 = "", audioContentType = "aud
 }
 
 function forceInterrupt() {
-  if (!listenStream || (!agentSpeaking && !agentBusy)) return;
+  if (!listenStream) return;
+  // speechSynthesis may be audible before utterance.onstart flips agentSpeaking.
+  if (!agentSpeaking && "speechSynthesis" in window && window.speechSynthesis.speaking) {
+    agentSpeaking = true;
+    agentRoot.classList.add("speaking");
+    setInterruptEnabled(true);
+  }
+  if (!agentSpeaking && !agentBusy) return;
   const detectedAt = Date.now();
   appendRuntimeEvent("barge_in.manual");
   if (agentSpeaking) {
@@ -942,5 +951,11 @@ window.__auroraTalk = {
     try { osc.stop(); } catch { /* ignore */ }
     osc.disconnect();
     gain.disconnect();
+  },
+  speakDemo(text, locale = "en-US") {
+    speak(text, locale);
+  },
+  forceInterrupt() {
+    forceInterrupt();
   },
 };
