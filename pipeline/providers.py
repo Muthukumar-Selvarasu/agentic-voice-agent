@@ -98,13 +98,27 @@ class Provider:
         tool_choice=None,
     ):
         """One chat-completion call. Returns the raw SDK response."""
-        return self.client.chat.completions.create(
-            model=self.llm_model,
-            messages=messages,
-            tools=tools or None,
-            tool_choice=(tool_choice or "auto") if tools else None,
-            temperature=0.3,
-        )
+        try:
+            return self.client.chat.completions.create(
+                model=self.llm_model,
+                messages=messages,
+                tools=tools or None,
+                tool_choice=(tool_choice or "auto") if tools else None,
+                temperature=0.3,
+            )
+        except Exception as exc:
+            # Groq (and some OpenAI-compatible hosts) return 400 tool_use_failed when
+            # a forced tool is required but the model answers in free text. Recover by
+            # synthesizing the forced tool call so grounding still runs.
+            forced = _tool_choice_name(tool_choice)
+            if forced and _is_tool_use_failed(exc):
+                args = (
+                    {"query": _last_user_text(messages)}
+                    if forced == "search_hotel_knowledge"
+                    else {}
+                )
+                return _mk_tool(forced, args)
+            raise
 
     # --- STT ---
     def transcribe(self, pcm_int16: bytes, sample_rate: int = 16000) -> str:
@@ -326,6 +340,20 @@ def _tool_choice_name(tool_choice) -> str | None:
         return None
     function = tool_choice.get("function") or {}
     return function.get("name")
+
+
+def _is_tool_use_failed(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    if "tool_use_failed" in text or "tool choice is required" in text:
+        return True
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") or {}
+        code = str(err.get("code") or "").lower()
+        message = str(err.get("message") or "").lower()
+        if code == "tool_use_failed" or "tool choice is required" in message:
+            return True
+    return False
 
 
 def _last_user_text(messages: list[dict]) -> str:

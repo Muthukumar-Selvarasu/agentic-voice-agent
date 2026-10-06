@@ -74,7 +74,7 @@ let pendingBargeDetectedAt = 0;
 const clientEvents = [];
 
 const tuning = {
-  endpointSilenceMs: Number(endpointControl?.value || 1100),
+  endpointSilenceMs: Number(endpointControl?.value || 650),
   sensitivity: 3.2,
   minTurnMs: 450,
   speechConfirmationMs: 140,

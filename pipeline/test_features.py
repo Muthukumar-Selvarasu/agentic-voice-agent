@@ -11,7 +11,14 @@ os.environ.setdefault("TTS_BACKEND", "print")
 
 from agent import Agent, explicit_language_request, is_courtesy_only, required_tool_for
 from knowledge import search_hotel_knowledge
-from providers import MockProvider, _env_or_default, _mk_tool, make_provider
+from providers import (
+    MockProvider,
+    Provider,
+    _env_or_default,
+    _is_tool_use_failed,
+    _mk_tool,
+    make_provider,
+)
 from router import AgentRouter
 from scale_check import estimate_capacity
 from telemetry import TurnTrace
@@ -162,6 +169,60 @@ class RetrievalTests(unittest.TestCase):
         )
         self.assertIsNone(provider.tool_choices[1])
         self.assertIn("tool.route_selected", [event["name"] for event in trace.events])
+
+    def test_tool_use_failed_recovers_forced_knowledge_tool(self):
+        self.assertTrue(
+            _is_tool_use_failed(
+                RuntimeError(
+                    "Error code: 400 - {'error': {'message': 'Tool choice is required, "
+                    "but model did not call a tool', 'code': 'tool_use_failed'}}"
+                )
+            )
+        )
+
+        class FlakyProvider(Provider):
+            def __init__(self):
+                self.name = "groq"
+                self.llm_model = "fake"
+                self.client = type(
+                    "Client",
+                    (),
+                    {
+                        "chat": type(
+                            "Chat",
+                            (),
+                            {
+                                "completions": type(
+                                    "Completions",
+                                    (),
+                                    {
+                                        "create": staticmethod(
+                                            lambda **_kwargs: (_ for _ in ()).throw(
+                                                RuntimeError(
+                                                    "Error code: 400 - tool_use_failed: "
+                                                    "Tool choice is required, but model "
+                                                    "did not call a tool"
+                                                )
+                                            )
+                                        )
+                                    },
+                                )(),
+                            },
+                        )(),
+                    },
+                )()
+
+        response = FlakyProvider().chat(
+            [{"role": "user", "content": "What time is check-in?"}],
+            tools=[{"type": "function"}],
+            tool_choice={
+                "type": "function",
+                "function": {"name": "search_hotel_knowledge"},
+            },
+        )
+        tool_call = response.choices[0].message.tool_calls[0]
+        self.assertEqual(tool_call.function.name, "search_hotel_knowledge")
+        self.assertIn("check-in", tool_call.function.arguments)
 
 
 class TelemetryTests(unittest.TestCase):
