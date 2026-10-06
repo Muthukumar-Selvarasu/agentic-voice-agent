@@ -34,6 +34,7 @@
           </div>
           <div class="call-controls">
             <button id="start-call" type="button">Start call</button>
+            <button id="interrupt-call" type="button" class="secondary interrupt" disabled>Interrupt</button>
             <button id="mute-call" type="button" class="secondary" disabled>Mute</button>
             <button id="end-call" type="button" class="danger" disabled>End call</button>
           </div>
@@ -57,22 +58,25 @@
       <section class="verify-script" aria-label="Workshop verify script">
         <div class="section-heading">
           <div>
-            <p class="eyebrow">FDE-227 verify</p>
-            <h2>Tamil language sequence</h2>
+            <p class="eyebrow">FDE-227 → 228 → 229</p>
+            <h2>One connected call</h2>
           </div>
-          <span class="listening-state">One connected call</span>
+          <span class="listening-state">http://localhost:5173</span>
         </div>
         <ol class="verify-steps">
           <li>Please speak Tamil.</li>
           <li>ரத்து கொள்கை என்ன? (or: What is the cancellation policy?)</li>
-          <li>நன்றி</li>
+          <li>நன்றி — badge must stay Tamil.</li>
           <li>Switch back to English.</li>
           <li>What time is check-in?</li>
+          <li>FDE-228: endpoint 350 → mid-sentence pause; then 900 → same sentence; restore 650.</li>
+          <li>Ask cancellation; ~0.5s into reply say “Wait, speak Tamil.” (or Interrupt / Space).</li>
+          <li>Ask one more Tamil question. Confirm Runtime: barge_in.candidate → barge_in.detected.</li>
         </ol>
         <p class="verify-note">
-          End call → reload → Start call. Pause for each reply. Do not book or transfer.
-          Then FDE-228: set endpoint 350 / 900 / 650, interrupt with “Wait, speak Tamil.”
-          Keep the Runtime trace open for FDE-229.
+          Hard-reload before Start call. Pause for each reply. Do not book or transfer.
+          Speakers: speak over Aurora or click Interrupt. Keep Runtime trace for FDE-229.
+          After the call: <code>python livekit/audit_spoken_session.py</code>
         </p>
       </section>
 
@@ -145,7 +149,7 @@
               <span>Audio output <strong id="audio-mode-value">Laptop Speaker</strong></span>
               <select id="audio-mode-control">
                 <option value="speaker" selected>Laptop Speaker (Echo Protected)</option>
-                <option value="headset">Headset / Headphones</option>
+                <option value="headset">Headset / Headphones (Easy interrupt)</option>
               </select>
             </label>
           </div>
