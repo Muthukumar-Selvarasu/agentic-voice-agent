@@ -107,6 +107,18 @@ class Provider:
                 temperature=0.3,
             )
         except Exception as exc:
+            # If rate limit exceeded on 120b, fall back to 20b
+            if ("rate_limit" in str(exc).lower() or getattr(exc, "status_code", None) == 429) and "120b" in self.llm_model:
+                try:
+                    return self.client.chat.completions.create(
+                        model="openai/gpt-oss-20b",
+                        messages=messages,
+                        tools=tools or None,
+                        tool_choice=(tool_choice or "auto") if tools else None,
+                        temperature=0.3,
+                    )
+                except Exception:
+                    pass
             # Groq (and some OpenAI-compatible hosts) return 400 tool_use_failed when
             # a forced tool is required but the model answers in free text. Recover by
             # synthesizing the forced tool call so grounding still runs.

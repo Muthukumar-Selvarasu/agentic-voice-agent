@@ -318,6 +318,27 @@ _ECHO_HALLUCINATIONS = {
     "see you next time",
 }
 
+# Short Whisper fillers from speaker bleed mid-playback. Keep real answers like yes/wait/stop.
+_BARGE_ECHO_FILLERS = {
+    "thanks",
+    "thank you",
+    "thank",
+    "well",
+    "so",
+    "the",
+    "a",
+    "um",
+    "uh",
+    "hmm",
+    "hm",
+    "you",
+    "i",
+    "and",
+    "hotel",
+    "okay so",
+    "oh",
+}
+
 
 def _is_probable_playback_echo(
     transcript: str,
@@ -336,18 +357,25 @@ def _is_probable_playback_echo(
     if len(normalized) <= 1:
         return True
 
-    # Never treat deliberate barge-ins as hallucination noise.
-    if not barge_in:
-        if normalized in _ECHO_HALLUCINATIONS:
-            return True
-        if any(h in normalized for h in ("watching", "subtitles by", "amara.org", "amara org")):
-            return True
+    if normalized in _ECHO_HALLUCINATIONS:
+        return True
+    if any(h in normalized for h in ("watching", "subtitles by", "amara.org", "amara org")):
+        return True
 
     spoken_norm = _normalize_utterance(spoken)
     if not spoken_norm:
         return False
 
     if barge_in:
+        if normalized in _BARGE_ECHO_FILLERS:
+            return True
+        # Single-token bleed of a word Aurora just said (e.g. "hotel", "assist", "today").
+        tokens = normalized.split()
+        spoken_words = set(spoken_norm.split())
+        if len(tokens) == 1 and tokens[0] in spoken_words and tokens[0] not in {
+            "yes", "no", "wait", "stop", "tamil", "english", "hello", "hi",
+        }:
+            return True
         # Deliberate barge-in: Caller answers/interrupts with choices like "Standard Queen",
         # "ocean view", "yes", "stop", "wait". Never drop answers or short phrases.
         if len(normalized) < 30 or len(normalized.split()) < 6:

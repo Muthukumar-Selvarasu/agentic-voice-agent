@@ -147,6 +147,15 @@ class PlaybackEchoTests(unittest.TestCase):
         self.assertFalse(_is_probable_playback_echo("Yes", options, barge_in=True))
         self.assertFalse(_is_probable_playback_echo("No", options, barge_in=True))
 
+    def test_barge_in_suppresses_whisper_fillers(self):
+        spoken = "Sure, what can I assist you with today at Aurora Hotel?"
+        for filler in ("Thanks.", "Well,", "So...", "Hotel", "Um"):
+            self.assertTrue(
+                _is_probable_playback_echo(filler, spoken, barge_in=True),
+                filler,
+            )
+        self.assertFalse(_is_probable_playback_echo("Wait", spoken, barge_in=True))
+        self.assertFalse(_is_probable_playback_echo("Yes", spoken, barge_in=True))
 
 
 class StaticCacheTests(unittest.TestCase):

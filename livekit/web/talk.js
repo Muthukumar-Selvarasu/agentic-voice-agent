@@ -1,4 +1,4 @@
-import { Room, RoomEvent, Track } from "/node_modules/livekit-client/dist/livekit-client.esm.mjs";
+import { Room, Track } from "/node_modules/livekit-client/dist/livekit-client.esm.mjs";
 
 const callerRoot = document.querySelector('[data-client="caller"]');
 const agentRoot = document.querySelector('[data-client="agent"]');
@@ -8,15 +8,12 @@ const startButton = document.querySelector("#start-call");
 const interruptButton = document.querySelector("#interrupt-call");
 const muteButton = document.querySelector("#mute-call");
 const endButton = document.querySelector("#end-call");
-const participantsEl = document.querySelector("#participants");
 const providerEl = document.querySelector("#provider");
 const languageEl = document.querySelector("#language");
 const transcriptEl = document.querySelector("#transcript");
 const sourcesEl = document.querySelector("#sources");
 const voiceStatusEl = document.querySelector("#voice-status");
 const listeningStateEl = document.querySelector("#listening-state");
-const eventsEl = document.querySelector("#events");
-const pipelineEl = document.querySelector("#pipeline");
 const endpointControl = document.querySelector("#endpoint-control");
 const endpointValue = document.querySelector("#endpoint-value");
 const sensitivityControl = document.querySelector("#sensitivity-control");
@@ -26,15 +23,6 @@ const audioModeValue = document.querySelector("#audio-mode-value");
 const vadReadout = document.querySelector("#vad-readout");
 const typedTurnForm = document.querySelector("#typed-turn");
 const typedTurnInput = document.querySelector("#typed-turn-input");
-
-const metrics = {
-  stt: document.querySelector("#metric-stt"),
-  llm: document.querySelector("#metric-llm"),
-  tools: document.querySelector("#metric-tools"),
-  total: document.querySelector("#metric-total"),
-  firstAudio: document.querySelector("#metric-first-audio"),
-  barge: document.querySelector("#metric-barge"),
-};
 
 const sessionId = `browser-${crypto.randomUUID()}`;
 let turnCounter = 0;
@@ -58,7 +46,6 @@ let muted = false;
 let noiseFloor = 0.008;
 let smoothedLevel = 0;
 let discardRecording = false;
-let currentTrace = null;
 let lastEndpointAt = 0;
 let playbackStartedAt = 0;
 let playbackEndedAt = 0;
@@ -89,30 +76,50 @@ const tuning = {
   maxTurnMs: 25000,
 };
 
+function resetListeningCalibration(reason = "mode_change") {
+  // Speaker bleed can inflate the floor; switching to headset must not keep that gate.
+  noiseFloor = 0.008;
+  smoothedLevel = 0;
+  playbackEchoFloor = 0.012;
+  playbackEchoPeak = 0.02;
+  speechCandidateAt = 0;
+  bargeCandidateAt = 0;
+  lastBargeHitAt = 0;
+  bargeRecordingCandidate = false;
+  listenCooldownUntil = 0;
+  if (listenStream) appendRuntimeEvent(`vad.recalibrate | ${reason}`);
+}
+
 function applyAudioMode(mode) {
   audioMode = mode;
   if (mode === "speaker") {
-    // Tuned for laptop speaker: responsive voice interruption with acoustic echo rejection.
-    tuning.speechConfirmationMs = 130;
-    tuning.bargeInConfirmationMs = 130;
-    tuning.bargeInArmMs = 140;
-    tuning.postPlaybackHoldMs = 500;
-    tuning.afterPlaybackEchoMs = 1500;
-    tuning.bargeEchoMultiple = 1.25;
-    tuning.playbackVolume = 0.35;
+    // Tuned for laptop speaker: harder barge gate so playback echo does not self-interrupt.
+    tuning.speechConfirmationMs = 140;
+    tuning.bargeInConfirmationMs = 220;
+    tuning.bargeInArmMs = 280;
+    tuning.postPlaybackHoldMs = 700;
+    tuning.afterPlaybackEchoMs = 1800;
+    tuning.bargeEchoMultiple = 1.45;
+    tuning.playbackVolume = 0.3;
     if (audioModeValue) audioModeValue.textContent = "Laptop Speaker";
   } else {
-    // Tuned for headset: ultra-responsive barge-in with no speaker echo penalty.
-    tuning.speechConfirmationMs = 100;
-    tuning.bargeInConfirmationMs = 95;
-    tuning.bargeInArmMs = 80;
-    tuning.postPlaybackHoldMs = 150;
-    tuning.afterPlaybackEchoMs = 500;
-    tuning.bargeEchoMultiple = 1.15;
+    // Tuned for headset: quiet mic + no acoustic echo — keep speech pickup easy.
+    tuning.speechConfirmationMs = 80;
+    tuning.bargeInConfirmationMs = 90;
+    tuning.bargeInArmMs = 60;
+    tuning.postPlaybackHoldMs = 120;
+    tuning.afterPlaybackEchoMs = 400;
+    tuning.bargeEchoMultiple = 1.1;
     tuning.playbackVolume = 1;
     if (audioModeValue) audioModeValue.textContent = "Headset";
   }
+  resetListeningCalibration(mode);
   if (activeAgentAudio) activeAgentAudio.volume = tuning.playbackVolume;
+  if (muted && listenStream) {
+    setListeningState("Muted", "Unmute to speak — microphone input is paused.");
+  } else if (listenStream && !agentSpeaking && !agentBusy) {
+    setListeningState("Listening", "Speak naturally. Aurora can be interrupted while talking.");
+  }
 }
 
 function setCallControls(connected) {
@@ -135,17 +142,28 @@ function setInterruptEnabled(enabled) {
 
 function setListeningState(state, detail) {
   listeningStateEl.textContent = state;
+  listeningStateEl.dataset.state = state.toLowerCase().replace(/\s+/g, "-");
   voiceStatusEl.textContent = detail;
 }
 
 function addTranscript(role, text, meta = "") {
   transcriptEl.querySelector(".empty")?.remove();
-  const item = document.createElement("div");
-  item.className = `bubble ${role}`;
+  const item = document.createElement("article");
+  item.className = `turn ${role}`;
   const label = document.createElement("div");
-  label.className = "bubble-label";
-  label.textContent = `${role === "caller" ? "Caller Demo" : "Aurora Agent"}${meta ? ` | ${meta}` : ""}`;
+  label.className = "turn-label";
+  const speaker = document.createElement("span");
+  speaker.className = "turn-speaker";
+  speaker.textContent = role === "caller" ? "Caller" : "Aurora Agent";
+  label.appendChild(speaker);
+  if (meta) {
+    const metaEl = document.createElement("span");
+    metaEl.className = "turn-meta";
+    metaEl.textContent = meta;
+    label.appendChild(metaEl);
+  }
   const body = document.createElement("div");
+  body.className = "turn-body";
   body.textContent = text;
   item.append(label, body);
   transcriptEl.appendChild(item);
@@ -156,7 +174,7 @@ function addTranscript(role, text, meta = "") {
 function addInterruption() {
   transcriptEl.querySelector(".empty")?.remove();
   const item = document.createElement("div");
-  item.className = "bubble interruption";
+  item.className = "turn interruption";
   item.textContent = "Caller interrupted agent playback";
   transcriptEl.appendChild(item);
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
@@ -166,67 +184,8 @@ function formatMs(value) {
   return `${Math.round(value || 0)} ms`;
 }
 
-function eventDetail(event) {
-  const attributes = event.attributes || {};
-  if (attributes.tool) return `${event.name} | ${attributes.tool}`;
-  if (attributes.language) return `${event.name} | ${attributes.language}`;
-  if (attributes.durationMs !== undefined) return `${event.name} | ${formatMs(attributes.durationMs)}`;
-  return event.name;
-}
-
-function renderTrace(trace) {
-  currentTrace = trace;
-  const timings = trace.timings || {};
-  metrics.stt.textContent = formatMs(timings.stt);
-  metrics.llm.textContent = formatMs(timings.llm);
-  metrics.tools.textContent = formatMs(timings.tools);
-  metrics.total.textContent = formatMs(trace.totalMs);
-
-  for (const element of pipelineEl.querySelectorAll("[data-stage]")) {
-    const stage = element.dataset.stage;
-    const completed = stage === "vad" || timings[stage] !== undefined;
-    element.classList.toggle("complete", completed);
-  }
-
-  paintEvents();
-}
-
-function paintEvents() {
-  eventsEl.innerHTML = "";
-  const serverEvents = (currentTrace?.events || []).slice(-14);
-  if (!clientEvents.length && !serverEvents.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty";
-    empty.textContent = "Turn events will appear here.";
-    eventsEl.appendChild(empty);
-    return;
-  }
-  for (const name of clientEvents.slice(-8)) {
-    const row = document.createElement("div");
-    row.className = "event-row";
-    const time = document.createElement("time");
-    time.textContent = "client";
-    const detail = document.createElement("span");
-    detail.textContent = name;
-    row.append(time, detail);
-    eventsEl.appendChild(row);
-  }
-  for (const event of serverEvents) {
-    const row = document.createElement("div");
-    row.className = "event-row";
-    const time = document.createElement("time");
-    time.textContent = `+${Math.round(event.offsetMs)}ms`;
-    const detail = document.createElement("span");
-    detail.textContent = eventDetail(event);
-    row.append(time, detail);
-    eventsEl.appendChild(row);
-  }
-  eventsEl.scrollTop = eventsEl.scrollHeight;
-}
-
 function appendRuntimeEvent(name) {
   clientEvents.push(name);
-  paintEvents();
 }
 
 function renderSources(sources) {
@@ -272,11 +231,9 @@ function beginAgentPlayback(token, backend) {
   bargeRecordingCandidate = false;
   if (recorder) stopTurnRecording(true);
   if (activeAgentAudio) activeAgentAudio.volume = tuning.playbackVolume;
-  pipelineEl.querySelector('[data-stage="tts"]')?.classList.add("complete");
   appendRuntimeEvent(`tts.playback_started | ${backend}`);
   if (lastEndpointAt) {
     const firstAudioMs = Date.now() - lastEndpointAt;
-    metrics.firstAudio.textContent = formatMs(firstAudioMs);
     appendRuntimeEvent(`turn.first_audio | ${formatMs(firstAudioMs)}`);
     lastEndpointAt = 0;
   }
@@ -380,8 +337,7 @@ function interruptAgent(detectedAt, turnAlreadyRecording = false) {
 
 function commitBargeIn(detectedAt) {
   addInterruption();
-  appendRuntimeEvent("barge_in.detected");
-  metrics.barge.textContent = formatMs(Date.now() - detectedAt);
+  appendRuntimeEvent(`barge_in.detected | ${formatMs(Date.now() - detectedAt)}`);
   pendingBargeDetectedAt = 0;
 }
 
@@ -395,22 +351,24 @@ function audioLevel() {
 }
 
 function thresholds() {
-  const start = Math.min(0.09, Math.max(0.012, noiseFloor * tuning.sensitivity));
   if (audioMode === "headset") {
-    // In headphones, no speaker echo enters the mic. A normal voice easily interrupts.
-    const barge = Math.max(0.015, start * 1.15);
+    // Headset mics are quieter than laptop mics. Higher UI sensitivity = easier pickup.
+    const ease = Math.max(1.3, 5.6 - tuning.sensitivity);
+    const start = Math.min(0.032, Math.max(0.007, noiseFloor * ease));
+    const barge = Math.max(0.011, start * 1.08);
     return {
       start,
-      end: Math.max(0.006, start * 0.52),
+      end: Math.max(0.004, start * 0.48),
       barge,
     };
   }
 
   // Speaker mode:
-  // Echo floor tracks Aurora's speaker bleed. Normal speech will rise ~20-30% above the floor.
+  // Echo floor tracks Aurora's speaker bleed. Require a clearer voice spike to barge.
+  const start = Math.min(0.09, Math.max(0.012, noiseFloor * tuning.sensitivity));
   const barge = Math.min(
-    0.065,
-    Math.max(0.022, start * 1.25, playbackEchoFloor * 1.25 + 0.004),
+    0.085,
+    Math.max(0.03, start * 1.35, playbackEchoFloor * tuning.bargeEchoMultiple + 0.008),
   );
   return {
     start,
@@ -494,7 +452,6 @@ function applyAgentPayload(payload, { callerLabel = "", callerMeta = "" } = {}) 
   const languageLabels = { en: "English", es: "Spanish", ta: "Tamil" };
   languageEl.textContent = languageLabels[payload.language] || "English";
   renderSources(payload.sources);
-  renderTrace(payload.trace);
   speak(
     payload.reply,
     payload.locale || "en-US",
@@ -538,7 +495,6 @@ async function sendAudioToAgent(audioBlob) {
       const candidate = clientEvents.lastIndexOf("barge_in.candidate");
       if (wasBargeIn && candidate >= 0) clientEvents.splice(candidate, 1);
       appendRuntimeEvent(`audio.suppressed | ${payload.ignoreReason}`);
-      renderTrace(payload.trace);
       renderSources([]);
       agentBusy = false;
       setListeningState("Listening", "Playback echo was suppressed. Continue speaking naturally.");
@@ -610,7 +566,9 @@ function vadLoop() {
   const limit = thresholds();
 
   if (!recorder && !agentSpeaking && !agentBusy && smoothedLevel < limit.start) {
-    noiseFloor = (noiseFloor * 0.985) + (rawLevel * 0.015);
+    // Cap samples so speaker bleed never becomes the "ambient" floor.
+    const sample = Math.min(rawLevel, audioMode === "headset" ? 0.02 : 0.016);
+    noiseFloor = (noiseFloor * 0.985) + (sample * 0.015);
   }
   vadReadout.textContent = agentSpeaking
     ? `echo ${playbackEchoFloor.toFixed(3)} | barge ${limit.barge.toFixed(3)}`
@@ -633,8 +591,8 @@ function vadLoop() {
       playbackEchoPeak *= 0.98;
     }
     const liveLimit = thresholds();
-    // In speaker mode, a voice adds acoustic energy on top of the speaker echo floor.
-    const relativeSpike = smoothedLevel > (playbackEchoFloor * 1.22 + 0.004);
+    // In speaker mode, require a clear voice spike above the learned echo floor.
+    const relativeSpike = smoothedLevel > (playbackEchoFloor * 1.38 + 0.008);
     const bargeHit = smoothedLevel > liveLimit.barge || (audioMode === "speaker" && relativeSpike);
 
     if (playbackAge < tuning.bargeInArmMs) {
@@ -673,12 +631,13 @@ function vadLoop() {
     }
   } else if (!agentBusy && !muted) {
     if (!recorder && now <= listenCooldownUntil) {
-      if (audioMode === "headset" && smoothedLevel > limit.start * 1.2) {
+      if (audioMode === "headset" && smoothedLevel > limit.start * 1.05) {
         // Headphones: allow speaking through a short post-playback hold.
         listenCooldownUntil = 0;
         speechCandidateAt = speechCandidateAt || now;
       } else if (smoothedLevel < limit.start * 1.5) {
-        noiseFloor = (noiseFloor * 0.95) + (rawLevel * 0.05);
+        const sample = Math.min(rawLevel, audioMode === "headset" ? 0.02 : 0.016);
+        noiseFloor = (noiseFloor * 0.95) + (sample * 0.05);
       }
     } else if (!recorder) {
       if (smoothedLevel > limit.start) {
@@ -707,48 +666,14 @@ function vadLoop() {
   vadFrame = requestAnimationFrame(vadLoop);
 }
 
-function attachRoomEvents(room) {
-  room.on(RoomEvent.ParticipantConnected, renderParticipants);
-  room.on(RoomEvent.ParticipantDisconnected, renderParticipants);
-  room.on(RoomEvent.TrackPublished, renderParticipants);
-  room.on(RoomEvent.TrackUnpublished, renderParticipants);
-  room.on(RoomEvent.Disconnected, renderParticipants);
-}
-
 async function connectParticipant(identity, name) {
   const params = new URLSearchParams({ identity, name });
   const response = await fetch(`/token?${params}`);
   if (!response.ok) throw new Error(`Token request failed: ${response.status}`);
   const session = await response.json();
   const room = new Room({ adaptiveStream: true, dynacast: true });
-  attachRoomEvents(room);
   await room.connect(session.url, session.token);
   return room;
-}
-
-function renderParticipants() {
-  participantsEl.innerHTML = "";
-  if (!callerRoom) {
-    const empty = document.createElement("div");
-    empty.className = "empty";
-    empty.textContent = "Participants join when the call starts.";
-    participantsEl.appendChild(empty);
-    return;
-  }
-
-  const participants = [callerRoom.localParticipant, ...callerRoom.remoteParticipants.values()];
-  for (const participant of participants) {
-    const row = document.createElement("div");
-    row.className = "participant";
-    const name = document.createElement("strong");
-    name.textContent = participant.name || participant.identity;
-    const state = document.createElement("span");
-    const audioPublished = [...participant.trackPublications.values()]
-      .some((publication) => publication.kind === "audio");
-    state.textContent = audioPublished ? "audio published" : "room participant";
-    row.append(name, state);
-    participantsEl.appendChild(row);
-  }
 }
 
 async function prepareListener() {
@@ -784,13 +709,12 @@ async function startCall() {
   agentRoom = await connectParticipant("aurora-agent", "Aurora Agent");
   agentStatus.textContent = "Connected";
   await prepareListener();
-  callerRoom = await connectParticipant("caller-demo", "Caller Demo");
+  callerRoom = await connectParticipant("caller-demo", "Caller");
   await callerRoom.localParticipant.publishTrack(listenStream.getAudioTracks()[0], {
     source: Track.Source.Microphone,
     name: "caller-microphone",
   });
   callerStatus.textContent = "Connected";
-  renderParticipants();
   try {
     const greetingResponse = await fetch("/greeting", {
       method: "POST",
@@ -802,7 +726,6 @@ async function startCall() {
       ? `TTS: ${greeting.ttsVoice || greeting.ttsModel}`
       : "Browser TTS";
     providerEl.textContent = `Provider: ${greeting.provider} | ${greeting.model} | ${ttsMeta}`;
-    renderTrace(greeting.trace);
     agentBusy = false;
     speak(
       greeting.reply,
@@ -828,7 +751,6 @@ async function endCall() {
   bargeCandidateAt = 0;
   pendingBargeDetectedAt = 0;
   clientEvents.length = 0;
-  currentTrace = null;
   listenStream?.getTracks().forEach((track) => track.stop());
   listenStream = null;
   if (audioContext) await audioContext.close();
@@ -844,8 +766,6 @@ async function endCall() {
   agentStatus.textContent = "Waiting";
   setListeningState("Idle", "Start the call, then speak naturally");
   setCallControls(false);
-  renderParticipants();
-  paintEvents();
 }
 
 async function toggleMute() {
@@ -876,6 +796,7 @@ endpointControl.addEventListener("input", () => {
 sensitivityControl.addEventListener("input", () => {
   tuning.sensitivity = Number(sensitivityControl.value);
   sensitivityValue.textContent = `${tuning.sensitivity.toFixed(1)}x`;
+  if (audioMode === "headset") resetListeningCalibration("sensitivity");
 });
 
 audioModeControl?.addEventListener("change", () => {

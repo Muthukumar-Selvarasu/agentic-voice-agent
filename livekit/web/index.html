@@ -20,12 +20,34 @@
         </div>
       </header>
 
+      <section class="tuning" aria-label="Turn tuning">
+        <div class="tuning-heading">
+          <p class="eyebrow">Turn tuning</p>
+          <span id="vad-readout">Calibrating</span>
+        </div>
+        <label class="tuning-cell">
+          <span>Endpoint silence <strong id="endpoint-value">650 ms</strong></span>
+          <input id="endpoint-control" type="range" min="350" max="3000" step="50" value="650" />
+        </label>
+        <label class="tuning-cell">
+          <span>Speech sensitivity <strong id="sensitivity-value">3.2x</strong></span>
+          <input id="sensitivity-control" type="range" min="1.8" max="5" step="0.1" value="3.2" />
+        </label>
+        <label class="tuning-cell">
+          <span>Audio output <strong id="audio-mode-value">Laptop Speaker</strong></span>
+          <select id="audio-mode-control">
+            <option value="speaker" selected>Laptop Speaker (Echo Protected)</option>
+            <option value="headset">Headset / Headphones (Easy interrupt)</option>
+          </select>
+        </label>
+      </section>
+
       <section class="stage" aria-label="LiveKit call participants">
         <article class="participant-card" data-client="caller">
           <div class="card-top">
             <div>
               <p class="eyebrow">Caller</p>
-              <h2>Caller Demo</h2>
+              <h2>Caller</h2>
             </div>
             <span class="state" data-role="status">Ready</span>
           </div>
@@ -55,46 +77,21 @@
         </article>
       </section>
 
-      <section class="verify-script" aria-label="Workshop verify script">
+      <section class="workspace">
         <div class="section-heading">
           <div>
-            <p class="eyebrow">FDE-227 → 228 → 229</p>
-            <h2>One connected call</h2>
+            <p class="eyebrow">Conversation</p>
+            <h2>Live transcript</h2>
           </div>
-          <span class="listening-state">http://localhost:5173</span>
+          <span class="listening-state" id="listening-state">Idle</span>
         </div>
-        <ol class="verify-steps">
-          <li>Please speak Tamil.</li>
-          <li>ரத்து கொள்கை என்ன? (or: What is the cancellation policy?)</li>
-          <li>நன்றி — badge must stay Tamil.</li>
-          <li>Switch back to English.</li>
-          <li>What time is check-in?</li>
-          <li>FDE-228: endpoint 350 (mid-pause can cut) → 900 (keeps pause) → restore 650; then barge with “Wait, speak Tamil.”</li>
-          <li>Ask cancellation; ~0.5s into reply say “Wait, speak Tamil.” (or Interrupt / Space). Confirm Runtime: barge_in.candidate → barge_in.detected.</li>
-          <li>Ask one more Tamil question on the same call.</li>
-        </ol>
-        <p class="verify-note">
-          Hard-reload before Start call. Pause for each reply. Do not book or transfer.
-          Speakers: speak over Aurora or click Interrupt. Keep Runtime trace for FDE-229.
-          After the call: <code>python livekit/audit_spoken_session.py</code>
-        </p>
-      </section>
-
-      <section class="workspace">
-        <div class="conversation-column">
-          <div class="section-heading">
-            <div>
-              <p class="eyebrow">Conversation</p>
-              <h2>Live transcript</h2>
-            </div>
-            <span class="listening-state" id="listening-state">Idle</span>
-          </div>
-          <div id="transcript" class="transcript" aria-live="polite">
-            <div class="empty">The call transcript will appear here.</div>
-          </div>
+        <div id="transcript" class="transcript" aria-live="polite">
+          <div class="empty">The call transcript will appear here.</div>
+        </div>
+        <div class="workspace-footer">
           <form id="typed-turn" class="typed-turn">
             <label>
-              <span class="eyebrow">Typed turn (same session)</span>
+              <span class="eyebrow">Typed turn</span>
               <input id="typed-turn-input" type="text" autocomplete="off" placeholder="Type if STT misses a line (e.g. நன்றி)" />
             </label>
             <button id="typed-turn-send" type="submit">Send</button>
@@ -103,66 +100,6 @@
             <p class="eyebrow">Grounding sources</p>
             <div id="sources" class="sources">No retrieval used in the latest turn.</div>
           </div>
-        </div>
-
-        <aside class="operations-column">
-          <div class="section-heading">
-            <div>
-              <p class="eyebrow">Turn telemetry</p>
-              <h2>Runtime trace</h2>
-            </div>
-          </div>
-          <div class="metrics" aria-label="Turn latency metrics">
-            <div><span>STT</span><strong id="metric-stt">0 ms</strong></div>
-            <div><span>LLM</span><strong id="metric-llm">0 ms</strong></div>
-            <div><span>Tools</span><strong id="metric-tools">0 ms</strong></div>
-            <div><span>Server</span><strong id="metric-total">0 ms</strong></div>
-            <div><span>EOT to audio</span><strong id="metric-first-audio">0 ms</strong></div>
-            <div><span>Barge-in</span><strong id="metric-barge">0 ms</strong></div>
-          </div>
-          <div id="pipeline" class="pipeline" aria-label="Voice pipeline">
-            <span data-stage="vad">VAD</span>
-            <span data-stage="stt">STT</span>
-            <span data-stage="routing">Router</span>
-            <span data-stage="retrieval">RAG</span>
-            <span data-stage="llm">LLM</span>
-            <span data-stage="tools">Tools</span>
-            <span data-stage="tts">TTS</span>
-          </div>
-          <div id="events" class="events">
-            <div class="empty">Turn events will appear here.</div>
-          </div>
-          <div class="tuning">
-            <div class="tuning-heading">
-              <p class="eyebrow">Turn tuning</p>
-              <span id="vad-readout">Calibrating</span>
-            </div>
-            <label>
-              <span>Endpoint silence <strong id="endpoint-value">650 ms</strong></span>
-              <input id="endpoint-control" type="range" min="350" max="3000" step="50" value="650" />
-            </label>
-            <label>
-              <span>Speech sensitivity <strong id="sensitivity-value">3.2x</strong></span>
-              <input id="sensitivity-control" type="range" min="1.8" max="5" step="0.1" value="3.2" />
-            </label>
-            <label>
-              <span>Audio output <strong id="audio-mode-value">Laptop Speaker</strong></span>
-              <select id="audio-mode-control">
-                <option value="speaker" selected>Laptop Speaker (Echo Protected)</option>
-                <option value="headset">Headset / Headphones (Easy interrupt)</option>
-              </select>
-            </label>
-          </div>
-        </aside>
-      </section>
-
-      <section class="room-band">
-        <div>
-          <p class="eyebrow">Room state</p>
-          <h2>LiveKit participants</h2>
-        </div>
-        <div id="participants" class="participants">
-          <div class="empty">Participants join when the call starts.</div>
         </div>
       </section>
     </main>
