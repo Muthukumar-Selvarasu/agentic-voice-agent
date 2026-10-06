@@ -27,8 +27,8 @@ PRESETS = {
     "groq": {
         "base_url": "https://api.groq.com/openai/v1",
         "api_key_env": "GROQ_API_KEY",
-        # 70b = reliable tool-calling; swap to llama-3.1-8b-instant for lower latency.
-        "llm_model": "llama-3.3-70b-versatile",
+        # Current Groq catalog (llama-3.3-70b-versatile retired on free keys).
+        "llm_model": "openai/gpt-oss-120b",
         "stt_model": "whisper-large-v3-turbo",
         "tts_model": "canopylabs/orpheus-v1-english",
         "tts_voice": "troy",
