@@ -20,6 +20,8 @@ const endpointControl = document.querySelector("#endpoint-control");
 const endpointValue = document.querySelector("#endpoint-value");
 const sensitivityControl = document.querySelector("#sensitivity-control");
 const sensitivityValue = document.querySelector("#sensitivity-value");
+const audioModeControl = document.querySelector("#audio-mode-control");
+const audioModeValue = document.querySelector("#audio-mode-value");
 const vadReadout = document.querySelector("#vad-readout");
 const typedTurnForm = document.querySelector("#typed-turn");
 const typedTurnInput = document.querySelector("#typed-turn-input");
@@ -59,6 +61,9 @@ let lastEndpointAt = 0;
 let playbackStartedAt = 0;
 let playbackEndedAt = 0;
 let playbackEchoFloor = 0.012;
+let playbackEchoPeak = 0.02;
+let turnMaxLevel = 0;
+let audioMode = "speaker";
 let pendingBargeInTurn = false;
 let currentTurnWasBargeIn = false;
 let currentTurnAfterPlayback = false;
@@ -69,18 +74,36 @@ let pendingBargeDetectedAt = 0;
 const clientEvents = [];
 
 const tuning = {
-  endpointSilenceMs: 650,
+  endpointSilenceMs: Number(endpointControl?.value || 1100),
   sensitivity: 3.2,
-  minTurnMs: 500,
-  speechConfirmationMs: 110,
-  // Speaker echo is loud and steady; require a longer, louder burst to interrupt.
-  bargeInConfirmationMs: 480,
-  bargeInArmMs: 700,
-  bargeEchoMultiple: 3.4,
-  postPlaybackHoldMs: 1600,
-  afterPlaybackEchoMs: 2800,
-  maxTurnMs: 20000,
+  minTurnMs: 450,
+  speechConfirmationMs: 140,
+  bargeInConfirmationMs: 220,
+  bargeInArmMs: 250,
+  bargeEchoMultiple: 1.5,
+  postPlaybackHoldMs: 350,
+  afterPlaybackEchoMs: 2000,
+  maxTurnMs: 25000,
 };
+
+function applyAudioMode(mode) {
+  audioMode = mode;
+  if (mode === "speaker") {
+    tuning.speechConfirmationMs = 180;
+    tuning.bargeInConfirmationMs = 600;
+    tuning.bargeInArmMs = 850;
+    tuning.postPlaybackHoldMs = 1400;
+    tuning.bargeEchoMultiple = 3.8;
+    if (audioModeValue) audioModeValue.textContent = "Laptop Speaker";
+  } else {
+    tuning.speechConfirmationMs = 120;
+    tuning.bargeInConfirmationMs = 420;
+    tuning.bargeInArmMs = 650;
+    tuning.postPlaybackHoldMs = 700;
+    tuning.bargeEchoMultiple = 2.4;
+    if (audioModeValue) audioModeValue.textContent = "Headset";
+  }
+}
 
 function setCallControls(connected) {
   startButton.disabled = connected;
@@ -219,6 +242,7 @@ function beginAgentPlayback(token, backend) {
   agentRoot.classList.add("speaking");
   playbackStartedAt = Date.now();
   playbackEchoFloor = Math.max(noiseFloor, 0.012);
+  playbackEchoPeak = Math.max(smoothedLevel, 0.02);
   listenCooldownUntil = playbackStartedAt + tuning.bargeInArmMs;
   bargeCandidateAt = 0;
   bargeRecordingCandidate = false;
@@ -321,9 +345,22 @@ function audioLevel() {
 
 function thresholds() {
   const start = Math.min(0.09, Math.max(0.012, noiseFloor * tuning.sensitivity));
-  // Speaker playback often sits near playbackEchoFloor; barge must clear it clearly.
+  if (audioMode === "speaker") {
+    const barge = Math.max(
+      0.15,
+      start * 3.0,
+      playbackEchoPeak * 1.5 + 0.04,
+      playbackEchoFloor * tuning.bargeEchoMultiple,
+    );
+    return {
+      start,
+      end: Math.max(0.008, start * 0.58),
+      barge,
+    };
+  }
+
   const barge = Math.min(
-    0.18,
+    0.20,
     Math.max(0.045, start * 2.1, playbackEchoFloor * tuning.bargeEchoMultiple),
   );
   return {
@@ -337,6 +374,7 @@ function startTurnRecording(isBargeIn = false) {
   if (!listenStream || recorder || agentBusy || muted) return;
   recordedChunks = [];
   discardRecording = false;
+  turnMaxLevel = smoothedLevel;
   recorder = new MediaRecorder(listenStream);
   currentTurnWasBargeIn = isBargeIn || pendingBargeInTurn;
   currentTurnAfterPlayback = Boolean(
@@ -353,10 +391,14 @@ function startTurnRecording(isBargeIn = false) {
     const shouldDiscard = discardRecording;
     const mimeType = recorder.mimeType || "audio/webm";
     const audioBlob = new Blob(recordedChunks, { type: mimeType });
+    const wasBargeIn = currentTurnWasBargeIn;
+    const maxLevel = turnMaxLevel;
     recorder = null;
     recordedChunks = [];
     callerRoot.classList.remove("speaking");
-    if (shouldDiscard || audioBlob.size < 800) {
+    const limit = thresholds();
+    const isTooQuiet = !wasBargeIn && maxLevel < limit.start * 1.15;
+    if (shouldDiscard || audioBlob.size < 1200 || isTooQuiet) {
       currentTurnWasBargeIn = false;
       if (agentSpeaking) {
         setListeningState("Agent speaking", "Interrupt naturally by speaking over Aurora.");
@@ -514,8 +556,9 @@ function vadLoop() {
 
   if (agentSpeaking && !muted) {
     const playbackAge = now - playbackStartedAt;
-    // Track speaker bleed into the mic so the barge threshold rides above it.
-    playbackEchoFloor = (playbackEchoFloor * 0.82) + (smoothedLevel * 0.18);
+    // Track speaker bleed into the mic: both moving floor and peak envelope
+    playbackEchoFloor = (playbackEchoFloor * 0.85) + (smoothedLevel * 0.15);
+    playbackEchoPeak = Math.max(playbackEchoPeak * 0.96, smoothedLevel);
     if (playbackAge < tuning.bargeInArmMs) {
       bargeCandidateAt = 0;
       bargeRecordingCandidate = false;
@@ -525,8 +568,7 @@ function vadLoop() {
         bargeRecordingCandidate = true;
         appendRuntimeEvent("barge_in.candidate");
       }
-      // Only interrupt + record after sustained loud speech. Do not record echo
-      // candidates early — that is what made Aurora cut herself off on speakers.
+      // Only interrupt + record after sustained loud speech above speaker volume
       if (now - bargeCandidateAt >= tuning.bargeInConfirmationMs) {
         bargeRecordingCandidate = false;
         interruptAgent(bargeCandidateAt, false);
@@ -541,8 +583,13 @@ function vadLoop() {
       }
       bargeCandidateAt = 0;
     }
-  } else if (!agentBusy && !muted && now > listenCooldownUntil) {
-    if (!recorder) {
+  } else if (!agentBusy && !muted) {
+    if (now <= listenCooldownUntil) {
+      // During post-playback cooldown, adapt noise floor to real room ambient level
+      if (smoothedLevel < limit.start * 1.5) {
+        noiseFloor = (noiseFloor * 0.95) + (rawLevel * 0.05);
+      }
+    } else if (!recorder) {
       if (smoothedLevel > limit.start) {
         speechCandidateAt = speechCandidateAt || now;
         if (now - speechCandidateAt >= tuning.speechConfirmationMs) {
@@ -553,6 +600,7 @@ function vadLoop() {
         speechCandidateAt = 0;
       }
     } else {
+      turnMaxLevel = Math.max(turnMaxLevel, smoothedLevel);
       if (smoothedLevel > limit.end) lastSpeechAt = now;
       const duration = now - recordingStartedAt;
       const endpointReached = duration >= tuning.minTurnMs
@@ -738,6 +786,10 @@ sensitivityControl.addEventListener("input", () => {
   sensitivityValue.textContent = `${tuning.sensitivity.toFixed(1)}x`;
 });
 
+audioModeControl?.addEventListener("change", () => {
+  applyAudioMode(audioModeControl.value);
+});
+
 startButton.addEventListener("click", () => {
   startCall().catch(async (error) => {
     setListeningState("Connection failed", error.message);
@@ -750,4 +802,5 @@ muteButton.addEventListener("click", () => toggleMute().catch((error) => {
 endButton.addEventListener("click", () => endCall());
 
 setCallControls(false);
+applyAudioMode("speaker");
 loadState();

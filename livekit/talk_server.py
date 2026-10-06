@@ -305,38 +305,81 @@ def _normalize_utterance(text: str) -> str:
     return " ".join(stripped.split())
 
 
+_ECHO_NOISE_OR_COURTESY = {
+    "all right",
+    "alright",
+    "thanks",
+    "thank you",
+    "thank you so much",
+    "thanks a lot",
+    "thank you very much",
+    "thank you for watching",
+    "thanks for watching",
+    "youre welcome",
+    "your welcome",
+    "welcome",
+    "okay",
+    "ok",
+    "bye",
+    "goodbye",
+    "good bye",
+    "have a good day",
+    "have a great day",
+    "see you next time",
+    "see you later",
+    "nandri",
+    "gracias",
+    "de nada",
+    "subtitles by",
+    "amara org",
+    "amara",
+    "you",
+    "the",
+    "yeah",
+    "yes",
+    "no",
+    "uh",
+    "um",
+    "ah",
+    "oh",
+}
+
+
 def _is_probable_playback_echo(transcript: str, spoken: str = "") -> bool:
     """Ignore audio that is only Aurora's own speaker playback coming back.
 
     A real interruption such as "Wait, speak Tamil" is kept. A short fragment
     of the line Aurora just spoke, near-duplicate STT of that line, or a bare
-    courtesy, is treated as echo.
+    courtesy/hallucination, is treated as echo.
     """
     normalized = _normalize_utterance(transcript)
     if not normalized:
         return True
     if len(normalized) <= 2:
         return True
-    if normalized in {
-        "all right",
-        "alright",
-        "thanks",
-        "thank you",
-        "youre welcome",
-        "your welcome",
-        "welcome",
-        "okay",
-        "ok",
-    }:
+    if normalized in _ECHO_NOISE_OR_COURTESY:
         return True
+    if any(h in normalized for h in ("watching", "subtitles by", "amara.org", "amara org")):
+        return True
+
     spoken_norm = _normalize_utterance(spoken)
     if not spoken_norm:
         return False
     if normalized in spoken_norm:
         return True
+
     # STT of speaker echo often returns a near-copy of the last reply.
     if SequenceMatcher(None, normalized, spoken_norm).ratio() >= 0.72:
         return True
+
+    # Token overlap: short echo fragments whose words are almost entirely from what was just spoken
+    t_words = [w for w in normalized.split() if len(w) > 1]
+    s_words = set(spoken_norm.split())
+    if t_words and len(t_words) <= 8 and s_words:
+        matching = sum(1 for w in t_words if w in s_words)
+        if matching / len(t_words) >= 0.6:
+            return True
+
     # Compare against each sentence of the last reply.
     for piece in spoken_norm.replace("?", ".").split("."):
         piece = piece.strip()

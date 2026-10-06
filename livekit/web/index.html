@@ -64,7 +64,7 @@
         </div>
         <ol class="verify-steps">
           <li>Please speak Tamil.</li>
-          <li>What is the cancellation policy?</li>
+          <li>ரத்து கொள்கை என்ன? (or: What is the cancellation policy?)</li>
           <li>நன்றி</li>
           <li>Switch back to English.</li>
           <li>What time is check-in?</li>
@@ -140,6 +140,13 @@
             <label>
               <span>Speech sensitivity <strong id="sensitivity-value">3.2x</strong></span>
               <input id="sensitivity-control" type="range" min="1.8" max="5" step="0.1" value="3.2" />
+            </label>
+            <label>
+              <span>Audio output <strong id="audio-mode-value">Laptop Speaker</strong></span>
+              <select id="audio-mode-control">
+                <option value="speaker" selected>Laptop Speaker (Echo Protected)</option>
+                <option value="headset">Headset / Headphones</option>
+              </select>
             </label>
           </div>
         </aside>

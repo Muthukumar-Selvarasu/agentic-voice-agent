@@ -107,6 +107,22 @@ class PlaybackEchoTests(unittest.TestCase):
             )
         )
 
+    def test_whisper_hallucination_is_echo(self):
+        spoken = "Thanks for calling Aurora Hotel reservations. How can I help?"
+        self.assertTrue(_is_probable_playback_echo("Thank you for watching.", spoken))
+        self.assertTrue(_is_probable_playback_echo("Goodbye", spoken))
+        self.assertTrue(_is_probable_playback_echo("Bye", spoken))
+        self.assertTrue(_is_probable_playback_echo("Subtitles by the Amara.org community", spoken))
+
+    def test_token_overlap_fragment_is_echo(self):
+        spoken = "We have a Standard Queen for $189 per night and a Deluxe King for $229. Which would you like?"
+        self.assertTrue(_is_probable_playback_echo("Standard Queen night", spoken))
+        self.assertTrue(_is_probable_playback_echo("Deluxe King which would you like", spoken))
+
+    def test_tamil_real_interruption_is_kept(self):
+        spoken = "அரோரா ஹோட்டல் முன்பதிவில் உதவ முடியும்."
+        self.assertFalse(_is_probable_playback_echo("ரத்து கொள்கை என்ன?", spoken))
+
 
 class StaticCacheTests(unittest.TestCase):
     def test_web_assets_are_uncached(self):

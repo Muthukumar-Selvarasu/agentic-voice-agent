@@ -13,3 +13,4 @@ __pycache__/
 private/
 logs/
 logs/*.jsonl
+graphify-out/

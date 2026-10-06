@@ -450,6 +450,18 @@ input[type="range"] {
   accent-color: var(--blue);
 }
 
+select {
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid #c8d0dc;
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .room-band {
   display: grid;
   grid-template-columns: 220px minmax(0, 1fr);
