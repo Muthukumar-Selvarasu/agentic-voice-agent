@@ -57,7 +57,10 @@ Booking flow:
 5. Before booking, summarize the selected room and ask for confirmation.
 6. After the caller confirms and required details are present, call create_booking.
 7. If the caller asks for a person or the request is outside what you can do,
-   call transfer_to_human. When the conversation is clearly over, call end_call."""
+   call transfer_to_human. Call end_call only for an explicit goodbye or hang-up
+   (for example goodbye, bye, that's all, end the call). A thank-you or courtesy
+   alone such as thanks, thank you, gracias, ¡Gracias!, or நன்றி is not the end
+   of the call — acknowledge it and stay on the line in the current language."""
 
 # OpenAI-style tool schema (works on Groq too).
 TOOLS = [
@@ -171,7 +174,9 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "end_call",
-            "description": "End the call politely when the conversation is finished.",
+            "description": "End the call politely after an explicit goodbye or hang-up. "
+                           "Do not use for a thank-you or courtesy alone "
+                           "(thanks, thank you, gracias, நன்றி).",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -227,6 +232,34 @@ def explicit_language_request(text: str, language: str) -> bool:
     if any(marker in text for marker in _LANGUAGE_MARKERS.get(language, ())):
         return True
     return bool(set(_normalized_tokens(text)) & _LANGUAGE_NAMES.get(language, set()))
+
+
+_COURTESY_PHRASES = {
+    "thanks",
+    "thank you",
+    "thanks a lot",
+    "thank you so much",
+    "gracias",
+    "muchas gracias",
+    "nandri",
+}
+
+_COURTESY_MARKERS = ("நன்றி", "¡gracias!", "gracias!")
+
+
+def is_courtesy_only(text: str) -> bool:
+    """True when the utterance is only a thank-you / courtesy, not a goodbye."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    if any(marker in lowered for marker in _COURTESY_MARKERS):
+        # Allow "gracias, goodbye" to still hang up.
+        tokens = set(_normalized_tokens(stripped))
+        goodbye = {"goodbye", "bye", "adios", "hang", "end"}
+        return not bool(tokens & goodbye)
+    normalized = " ".join(_normalized_tokens(stripped))
+    return normalized in _COURTESY_PHRASES
 
 
 def required_tool_for(text: str) -> str | None:
@@ -453,6 +486,17 @@ class Agent:
                             result = {
                                 "result": "Unsupported language. Continue in the current language.",
                             }
+                    elif tc.function.name == "end_call" and is_courtesy_only(user_text):
+                        trace.event(
+                            "control.hangup_rejected",
+                            reason="courtesy_only",
+                        )
+                        result = {
+                            "result": (
+                                "Call not ended. The caller only said a courtesy or thank-you. "
+                                "Acknowledge them and stay on the line in the current language."
+                            ),
+                        }
                     elif tc.function.name == "search_hotel_knowledge":
                         with trace.span("retrieval", query=args.get("query", "")):
                             result = run_tool(tc.function.name, args)

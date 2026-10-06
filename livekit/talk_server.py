@@ -11,6 +11,7 @@ import os
 import sys
 import threading
 import warnings
+from difflib import SequenceMatcher
 from io import BytesIO
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +29,7 @@ PIPELINE_ROOT = ASSIGNMENT_ROOT / "pipeline"
 _session_registry_lock = threading.Lock()
 _agent_sessions: dict[str, object] = {}
 _session_locks: dict[str, threading.Lock] = {}
+_last_spoken: dict[str, str] = {}
 
 GREETING = "Thanks for calling Aurora Hotel reservations. How can I help?"
 
@@ -128,6 +130,17 @@ def _reset_session(session_id: str) -> None:
     with _session_registry_lock:
         _agent_sessions.pop(session_id, None)
         _session_locks.pop(session_id, None)
+        _last_spoken.pop(session_id, None)
+
+
+def _remember_spoken(session_id: str, text: str) -> None:
+    with _session_registry_lock:
+        _last_spoken[session_id] = text
+
+
+def _last_spoken_text(session_id: str) -> str:
+    with _session_registry_lock:
+        return _last_spoken.get(session_id, "")
 
 
 def _trace(session_id: str, turn_id: str | None = None):
@@ -191,6 +204,7 @@ def _greeting_reply(session_id: str) -> dict:
     trace.event("greeting.requested")
     with lock:
         tts = _browser_tts_payload(agent, trace, GREETING)
+    _remember_spoken(session_id, GREETING)
     return _finish_response(
         agent,
         trace,
@@ -208,6 +222,7 @@ def _agent_reply(text: str, session_id: str, turn_id: str | None) -> dict:
     with lock:
         reply, action = agent.respond(text, trace=trace)
         tts = _browser_tts_payload(agent, trace, reply)
+    _remember_spoken(session_id, reply)
     return _finish_response(agent, trace, reply, action, **tts)
 
 
@@ -217,12 +232,11 @@ def _voice_agent_reply(
     session_id: str,
     turn_id: str | None,
     was_barge_in: bool,
+    after_playback: bool = False,
 ) -> dict:
     agent, lock = _get_session(session_id)
     trace = _trace(session_id, turn_id)
     trace.event("audio.received", bytes=len(audio), contentType=content_type)
-    if was_barge_in:
-        trace.event("barge_in.turn_started")
     with lock:
         if getattr(agent.provider, "name", "") == "mock":
             with trace.span("stt", model=getattr(agent.provider, "stt_model", "unknown")):
@@ -246,8 +260,17 @@ def _voice_agent_reply(
                     transcription_args["prompt"] = stt_prompt
                 stt = agent.provider.client.audio.transcriptions.create(**transcription_args)
             transcript = (stt if isinstance(stt, str) else stt.text).strip()
-        if was_barge_in and _is_probable_playback_echo(transcript):
-            trace.event("barge_in.echo_suppressed", transcript=transcript)
+        # Speaker bleed often arrives as a normal turn right after TTS ends, not
+        # only as an X-Barge-In interrupt. Suppress either path when it matches.
+        if (was_barge_in or after_playback) and _is_probable_playback_echo(
+            transcript, _last_spoken_text(session_id)
+        ):
+            trace.event(
+                "barge_in.echo_suppressed",
+                transcript=transcript,
+                afterPlayback=after_playback,
+                wasBargeIn=was_barge_in,
+            )
             return _finish_response(
                 agent,
                 trace,
@@ -259,8 +282,11 @@ def _voice_agent_reply(
                 ignoreReason="probable_playback_echo",
                 response_sources=[],
             )
+        if was_barge_in:
+            trace.event("barge_in.turn_started")
         reply, action = agent.respond(transcript, trace=trace)
         tts = _browser_tts_payload(agent, trace, reply)
+    _remember_spoken(session_id, reply)
     return _finish_response(
         agent,
         trace,
@@ -272,18 +298,55 @@ def _voice_agent_reply(
     )
 
 
-def _is_probable_playback_echo(transcript: str) -> bool:
-    normalized = " ".join(
-        transcript.lower().replace("'", "").replace(".", "").replace(",", "").split()
-    )
-    return normalized in {
+def _normalize_utterance(text: str) -> str:
+    stripped = text.lower()
+    for mark in ("'", ".", ",", "!", "?", "¡", "¿", "।", "…", ";", ":"):
+        stripped = stripped.replace(mark, "")
+    return " ".join(stripped.split())
+
+
+def _is_probable_playback_echo(transcript: str, spoken: str = "") -> bool:
+    """Ignore audio that is only Aurora's own speaker playback coming back.
+
+    A real interruption such as "Wait, speak Tamil" is kept. A short fragment
+    of the line Aurora just spoke, near-duplicate STT of that line, or a bare
+    courtesy, is treated as echo.
+    """
+    normalized = _normalize_utterance(transcript)
+    if not normalized:
+        return True
+    if len(normalized) <= 2:
+        return True
+    if normalized in {
         "all right",
         "alright",
         "thanks",
         "thank you",
         "youre welcome",
         "your welcome",
-    }
+        "welcome",
+        "okay",
+        "ok",
+    }:
+        return True
+    spoken_norm = _normalize_utterance(spoken)
+    if not spoken_norm:
+        return False
+    if normalized in spoken_norm:
+        return True
+    # STT of speaker echo often returns a near-copy of the last reply.
+    if SequenceMatcher(None, normalized, spoken_norm).ratio() >= 0.72:
+        return True
+    # Compare against each sentence of the last reply.
+    for piece in spoken_norm.replace("?", ".").split("."):
+        piece = piece.strip()
+        if len(piece) >= 8 and (
+            normalized in piece
+            or piece in normalized
+            or SequenceMatcher(None, normalized, piece).ratio() >= 0.78
+        ):
+            return True
+    return False
 
 
 def _token(identity: str, name: str, room: str) -> str:
@@ -305,9 +368,20 @@ def _token(identity: str, name: str, room: str) -> str:
     )
 
 
+def static_no_store(path: str) -> bool:
+    """Local demo iterates on talk.js often; avoid sticky cached playback logic."""
+    parsed = urlparse(path).path
+    return parsed == "/" or parsed.startswith("/web/")
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
+
+    def end_headers(self) -> None:
+        if static_no_store(self.path):
+            self.send_header("Cache-Control", "no-store")
+        super().end_headers()
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -350,7 +424,12 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=500)
         if parsed.path == "/voice-agent":
-            return self._handle_voice_agent(session_id, turn_id)
+            return self._handle_voice_agent(
+                session_id,
+                turn_id,
+                self.headers.get("X-Barge-In", "false").lower() == "true",
+                self.headers.get("X-After-Playback", "false").lower() == "true",
+            )
         if parsed.path != "/agent":
             self.send_error(404, "File not found")
             return
@@ -368,7 +447,13 @@ class Handler(SimpleHTTPRequestHandler):
             return
         self._send_json(response)
 
-    def _handle_voice_agent(self, session_id: str, turn_id: str | None) -> None:
+    def _handle_voice_agent(
+        self,
+        session_id: str,
+        turn_id: str | None,
+        was_barge_in: bool = False,
+        after_playback: bool = False,
+    ) -> None:
         try:
             length = int(self.headers.get("Content-Length", "0"))
             audio = self.rfile.read(length)
@@ -379,7 +464,8 @@ class Handler(SimpleHTTPRequestHandler):
                 self.headers.get("Content-Type", ""),
                 session_id,
                 turn_id,
-                self.headers.get("X-Barge-In", "false").lower() == "true",
+                was_barge_in,
+                after_playback,
             )
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=500)

@@ -21,6 +21,8 @@ const endpointValue = document.querySelector("#endpoint-value");
 const sensitivityControl = document.querySelector("#sensitivity-control");
 const sensitivityValue = document.querySelector("#sensitivity-value");
 const vadReadout = document.querySelector("#vad-readout");
+const typedTurnForm = document.querySelector("#typed-turn");
+const typedTurnInput = document.querySelector("#typed-turn-input");
 
 const metrics = {
   stt: document.querySelector("#metric-stt"),
@@ -55,20 +57,28 @@ let discardRecording = false;
 let currentTrace = null;
 let lastEndpointAt = 0;
 let playbackStartedAt = 0;
+let playbackEndedAt = 0;
 let playbackEchoFloor = 0.012;
 let pendingBargeInTurn = false;
 let currentTurnWasBargeIn = false;
+let currentTurnAfterPlayback = false;
 let activeAgentAudio = null;
 let playbackToken = 0;
 let bargeRecordingCandidate = false;
+let pendingBargeDetectedAt = 0;
+const clientEvents = [];
 
 const tuning = {
   endpointSilenceMs: 650,
   sensitivity: 3.2,
   minTurnMs: 500,
   speechConfirmationMs: 110,
-  bargeInConfirmationMs: 200,
-  bargeInArmMs: 450,
+  // Speaker echo is loud and steady; require a longer, louder burst to interrupt.
+  bargeInConfirmationMs: 480,
+  bargeInArmMs: 700,
+  bargeEchoMultiple: 3.4,
+  postPlaybackHoldMs: 1600,
+  afterPlaybackEchoMs: 2800,
   maxTurnMs: 20000,
 };
 
@@ -135,8 +145,30 @@ function renderTrace(trace) {
     element.classList.toggle("complete", completed);
   }
 
+  paintEvents();
+}
+
+function paintEvents() {
   eventsEl.innerHTML = "";
-  for (const event of (trace.events || []).slice(-14)) {
+  const serverEvents = (currentTrace?.events || []).slice(-14);
+  if (!clientEvents.length && !serverEvents.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "Turn events will appear here.";
+    eventsEl.appendChild(empty);
+    return;
+  }
+  for (const name of clientEvents.slice(-8)) {
+    const row = document.createElement("div");
+    row.className = "event-row";
+    const time = document.createElement("time");
+    time.textContent = "client";
+    const detail = document.createElement("span");
+    detail.textContent = name;
+    row.append(time, detail);
+    eventsEl.appendChild(row);
+  }
+  for (const event of serverEvents) {
     const row = document.createElement("div");
     row.className = "event-row";
     const time = document.createElement("time");
@@ -146,19 +178,12 @@ function renderTrace(trace) {
     row.append(time, detail);
     eventsEl.appendChild(row);
   }
+  eventsEl.scrollTop = eventsEl.scrollHeight;
 }
 
 function appendRuntimeEvent(name) {
-  eventsEl.querySelector(".empty")?.remove();
-  const row = document.createElement("div");
-  row.className = "event-row";
-  const time = document.createElement("time");
-  time.textContent = "client";
-  const detail = document.createElement("span");
-  detail.textContent = name;
-  row.append(time, detail);
-  eventsEl.appendChild(row);
-  eventsEl.scrollTop = eventsEl.scrollHeight;
+  clientEvents.push(name);
+  paintEvents();
 }
 
 function renderSources(sources) {
@@ -195,6 +220,9 @@ function beginAgentPlayback(token, backend) {
   playbackStartedAt = Date.now();
   playbackEchoFloor = Math.max(noiseFloor, 0.012);
   listenCooldownUntil = playbackStartedAt + tuning.bargeInArmMs;
+  bargeCandidateAt = 0;
+  bargeRecordingCandidate = false;
+  if (recorder) stopTurnRecording(true);
   pipelineEl.querySelector('[data-stage="tts"]')?.classList.add("complete");
   appendRuntimeEvent(`tts.playback_started | ${backend}`);
   if (lastEndpointAt) {
@@ -211,7 +239,11 @@ function finishAgentPlayback(token) {
   activeAgentAudio = null;
   agentSpeaking = false;
   agentRoot.classList.remove("speaking");
-  listenCooldownUntil = Date.now() + 500;
+  playbackEndedAt = Date.now();
+  // Hold off listening until speaker reverb decays; stops self-turns after TTS.
+  listenCooldownUntil = playbackEndedAt + tuning.postPlaybackHoldMs;
+  bargeCandidateAt = 0;
+  bargeRecordingCandidate = false;
   if (listenStream) {
     setListeningState("Listening", "Speak naturally. Aurora can be interrupted while talking.");
   }
@@ -264,12 +296,18 @@ function interruptAgent(detectedAt, turnAlreadyRecording = false) {
   stopAgentPlayback();
   agentSpeaking = false;
   agentRoot.classList.remove("speaking");
+  playbackEndedAt = Date.now();
   listenCooldownUntil = Date.now() + 80;
   pendingBargeInTurn = !turnAlreadyRecording;
+  pendingBargeDetectedAt = detectedAt;
+  setListeningState("Interrupted", "Aurora stopped. Listening to the caller.");
+}
+
+function commitBargeIn(detectedAt) {
   addInterruption();
   appendRuntimeEvent("barge_in.detected");
   metrics.barge.textContent = formatMs(Date.now() - detectedAt);
-  setListeningState("Interrupted", "Aurora stopped. Listening to the caller.");
+  pendingBargeDetectedAt = 0;
 }
 
 function audioLevel() {
@@ -283,10 +321,15 @@ function audioLevel() {
 
 function thresholds() {
   const start = Math.min(0.09, Math.max(0.012, noiseFloor * tuning.sensitivity));
+  // Speaker playback often sits near playbackEchoFloor; barge must clear it clearly.
+  const barge = Math.min(
+    0.18,
+    Math.max(0.045, start * 2.1, playbackEchoFloor * tuning.bargeEchoMultiple),
+  );
   return {
     start,
     end: Math.max(0.008, start * 0.58),
-    barge: Math.min(0.12, Math.max(0.024, start * 1.55, playbackEchoFloor * 1.8)),
+    barge,
   };
 }
 
@@ -296,6 +339,9 @@ function startTurnRecording(isBargeIn = false) {
   discardRecording = false;
   recorder = new MediaRecorder(listenStream);
   currentTurnWasBargeIn = isBargeIn || pendingBargeInTurn;
+  currentTurnAfterPlayback = Boolean(
+    playbackEndedAt && Date.now() - playbackEndedAt < tuning.afterPlaybackEchoMs,
+  );
   pendingBargeInTurn = false;
   recordingStartedAt = Date.now();
   lastSpeechAt = recordingStartedAt;
@@ -331,6 +377,30 @@ function stopTurnRecording(discard = false) {
   recorder.stop();
 }
 
+function applyAgentPayload(payload, { callerLabel = "", callerMeta = "" } = {}) {
+  if (callerLabel) addTranscript("caller", callerLabel, callerMeta);
+  const ttsMeta = payload.ttsBackend === "provider"
+    ? `TTS: ${payload.ttsVoice || payload.ttsModel}`
+    : "Browser TTS";
+  const meta = [payload.language?.toUpperCase(), ttsMeta, payload.action ? `action: ${payload.action}` : ""]
+    .filter(Boolean)
+    .join(" | ");
+  addTranscript("agent", payload.reply, meta);
+  providerEl.textContent = `Provider: ${payload.provider} | ${payload.model} | ${ttsMeta}`;
+  const languageLabels = { en: "English", es: "Spanish", ta: "Tamil" };
+  languageEl.textContent = languageLabels[payload.language] || "English";
+  renderSources(payload.sources);
+  renderTrace(payload.trace);
+  speak(
+    payload.reply,
+    payload.locale || "en-US",
+    payload.audioBase64 || "",
+    payload.audioContentType || "audio/wav",
+  );
+  if (payload.action === "transfer") agentStatus.textContent = "Transferring";
+  if (payload.action === "hangup") agentStatus.textContent = "Call complete";
+}
+
 async function sendAudioToAgent(audioBlob) {
   agentBusy = true;
   setListeningState("Processing", "Transcribing and running the hotel agent.");
@@ -338,7 +408,9 @@ async function sendAudioToAgent(audioBlob) {
   const pending = addTranscript("agent", "Processing turn", "STT -> Router -> RAG -> LLM -> Tools");
   const turnId = `turn-${++turnCounter}`;
   const wasBargeIn = currentTurnWasBargeIn;
+  const afterPlayback = currentTurnAfterPlayback;
   currentTurnWasBargeIn = false;
+  currentTurnAfterPlayback = false;
 
   try {
     const response = await fetch("/voice-agent", {
@@ -348,6 +420,7 @@ async function sendAudioToAgent(audioBlob) {
         "X-Session-ID": sessionId,
         "X-Turn-ID": turnId,
         "X-Barge-In": String(wasBargeIn),
+        "X-After-Playback": String(afterPlayback),
       },
       body: audioBlob,
     });
@@ -357,6 +430,9 @@ async function sendAudioToAgent(audioBlob) {
 
     if (payload.ignored) {
       voicePlaceholder.remove();
+      pendingBargeDetectedAt = 0;
+      const candidate = clientEvents.lastIndexOf("barge_in.candidate");
+      if (wasBargeIn && candidate >= 0) clientEvents.splice(candidate, 1);
       appendRuntimeEvent(`audio.suppressed | ${payload.ignoreReason}`);
       renderTrace(payload.trace);
       renderSources([]);
@@ -366,28 +442,12 @@ async function sendAudioToAgent(audioBlob) {
     }
 
     voicePlaceholder.remove();
-    addTranscript("caller", payload.transcript, `STT: ${payload.sttModel}`);
-    const ttsMeta = payload.ttsBackend === "provider"
-      ? `TTS: ${payload.ttsVoice || payload.ttsModel}`
-      : "Browser TTS";
-    const meta = [payload.language?.toUpperCase(), ttsMeta, payload.action ? `action: ${payload.action}` : ""]
-      .filter(Boolean)
-      .join(" | ");
-    addTranscript("agent", payload.reply, meta);
-    providerEl.textContent = `Provider: ${payload.provider} | ${payload.model} | ${ttsMeta}`;
-    const languageLabels = { en: "English", es: "Spanish", ta: "Tamil" };
-    languageEl.textContent = languageLabels[payload.language] || "English";
-    renderSources(payload.sources);
-    renderTrace(payload.trace);
+    if (wasBargeIn && pendingBargeDetectedAt) commitBargeIn(pendingBargeDetectedAt);
+    applyAgentPayload(payload, {
+      callerLabel: payload.transcript,
+      callerMeta: `STT: ${payload.sttModel}`,
+    });
     agentBusy = false;
-    speak(
-      payload.reply,
-      payload.locale || "en-US",
-      payload.audioBase64 || "",
-      payload.audioContentType || "audio/wav",
-    );
-    if (payload.action === "transfer") agentStatus.textContent = "Transferring";
-    if (payload.action === "hangup") agentStatus.textContent = "Call complete";
   } catch (error) {
     pending.remove();
     voicePlaceholder.remove();
@@ -396,6 +456,47 @@ async function sendAudioToAgent(audioBlob) {
     setListeningState("Error", "The turn failed. Speak again to retry.");
   }
 }
+
+async function sendTextToAgent(text) {
+  const cleaned = text.trim();
+  if (!cleaned || agentBusy) return;
+  agentBusy = true;
+  setListeningState("Processing", "Running the hotel agent on a typed turn.");
+  const pending = addTranscript("agent", "Processing turn", "Router -> RAG -> LLM -> Tools");
+  const turnId = `turn-${++turnCounter}`;
+  try {
+    const response = await fetch("/agent", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Session-ID": sessionId,
+        "X-Turn-ID": turnId,
+      },
+      body: JSON.stringify({ text: cleaned }),
+    });
+    const payload = await response.json();
+    pending.remove();
+    if (!response.ok) throw new Error(payload.error || `Agent request failed: ${response.status}`);
+    applyAgentPayload(payload, { callerLabel: cleaned, callerMeta: "typed" });
+    agentBusy = false;
+    setListeningState(
+      listenStream ? "Listening" : "Idle",
+      listenStream ? "Speak naturally, or type the next line." : "Start the call to speak, or keep typing.",
+    );
+  } catch (error) {
+    pending.remove();
+    addTranscript("agent", error.message, "error");
+    agentBusy = false;
+    setListeningState("Error", "The typed turn failed. Try again.");
+  }
+}
+
+typedTurnForm?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const value = typedTurnInput.value;
+  typedTurnInput.value = "";
+  sendTextToAgent(value);
+});
 
 function vadLoop() {
   if (!listenStream) return;
@@ -413,31 +514,32 @@ function vadLoop() {
 
   if (agentSpeaking && !muted) {
     const playbackAge = now - playbackStartedAt;
+    // Track speaker bleed into the mic so the barge threshold rides above it.
+    playbackEchoFloor = (playbackEchoFloor * 0.82) + (smoothedLevel * 0.18);
     if (playbackAge < tuning.bargeInArmMs) {
-      playbackEchoFloor = (playbackEchoFloor * 0.88) + (smoothedLevel * 0.12);
       bargeCandidateAt = 0;
+      bargeRecordingCandidate = false;
     } else if (smoothedLevel > limit.barge) {
       if (!bargeCandidateAt) {
         bargeCandidateAt = now;
         bargeRecordingCandidate = true;
         appendRuntimeEvent("barge_in.candidate");
-        startTurnRecording(true);
-        lastSpeechAt = now;
       }
+      // Only interrupt + record after sustained loud speech. Do not record echo
+      // candidates early — that is what made Aurora cut herself off on speakers.
       if (now - bargeCandidateAt >= tuning.bargeInConfirmationMs) {
         bargeRecordingCandidate = false;
-        interruptAgent(bargeCandidateAt, true);
-        pendingBargeInTurn = false;
+        interruptAgent(bargeCandidateAt, false);
+        startTurnRecording(true);
         lastSpeechAt = now;
         bargeCandidateAt = 0;
       }
     } else {
       if (bargeRecordingCandidate) {
-        stopTurnRecording(true);
         bargeRecordingCandidate = false;
+        appendRuntimeEvent("barge_in.candidate_dropped");
       }
       bargeCandidateAt = 0;
-      playbackEchoFloor = (playbackEchoFloor * 0.995) + (smoothedLevel * 0.005);
     }
   } else if (!agentBusy && !muted && now > listenCooldownUntil) {
     if (!recorder) {
@@ -584,6 +686,9 @@ async function endCall() {
   agentBusy = false;
   bargeRecordingCandidate = false;
   bargeCandidateAt = 0;
+  pendingBargeDetectedAt = 0;
+  clientEvents.length = 0;
+  currentTrace = null;
   listenStream?.getTracks().forEach((track) => track.stop());
   listenStream = null;
   if (audioContext) await audioContext.close();
@@ -600,6 +705,7 @@ async function endCall() {
   setListeningState("Idle", "Start the call, then speak naturally");
   setCallControls(false);
   renderParticipants();
+  paintEvents();
 }
 
 async function toggleMute() {

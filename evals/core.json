@@ -121,7 +121,8 @@
         "user": "நன்றி",
         "expect": {
           "language": "ta",
-          "tools": []
+          "tools": [],
+          "action": null
         }
       },
       {

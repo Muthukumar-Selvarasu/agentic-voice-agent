@@ -9,7 +9,7 @@ from unittest.mock import patch
 os.environ["PROVIDER"] = "mock"
 os.environ.setdefault("TTS_BACKEND", "print")
 
-from agent import Agent, explicit_language_request, required_tool_for
+from agent import Agent, explicit_language_request, is_courtesy_only, required_tool_for
 from knowledge import search_hotel_knowledge
 from providers import MockProvider, _env_or_default, _mk_tool, make_provider
 from router import AgentRouter
@@ -69,6 +69,33 @@ class RouterTests(unittest.TestCase):
             "router.language_change_rejected",
             [event["name"] for event in trace.events],
         )
+
+    def test_courtesy_phrases_are_detected(self):
+        self.assertTrue(is_courtesy_only("நன்றி"))
+        self.assertTrue(is_courtesy_only("¡Gracias!"))
+        self.assertTrue(is_courtesy_only("Thank you"))
+        self.assertFalse(is_courtesy_only("Goodbye"))
+        self.assertFalse(is_courtesy_only("Thanks, goodbye"))
+
+    def test_overeager_end_call_on_courtesy_is_rejected(self):
+        class OvereagerHangup(MockProvider):
+            def chat(self, messages, tools=None, tool_choice=None):
+                if messages[-1].get("role") == "user":
+                    return _mk_tool("end_call", {})
+                return super().chat(messages, tools=tools, tool_choice=tool_choice)
+
+        agent = Agent(OvereagerHangup())
+        agent.router.set_language("ta")
+        trace = TurnTrace(session_id="test", turn_id="nandri")
+        reply, action = agent.respond("நன்றி", trace=trace)
+
+        self.assertIsNone(action)
+        self.assertEqual(agent.current_language, "ta")
+        self.assertIn(
+            "control.hangup_rejected",
+            [event["name"] for event in trace.events],
+        )
+        self.assertTrue(reply)
 
 
 class ProviderConfigurationTests(unittest.TestCase):

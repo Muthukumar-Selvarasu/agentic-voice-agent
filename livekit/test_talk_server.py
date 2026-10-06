@@ -8,7 +8,13 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
-from talk_server import _browser_tts_payload, hosted_config_errors, listen_address
+from talk_server import (
+    _browser_tts_payload,
+    _is_probable_playback_echo,
+    hosted_config_errors,
+    listen_address,
+    static_no_store,
+)
 
 
 class FakeTrace:
@@ -70,6 +76,45 @@ class BrowserTtsPayloadTests(unittest.TestCase):
         self.assertEqual(payload, {"ttsBackend": "browser", "ttsFallback": True})
         self.assertEqual(trace.events[0][0], "tts.fallback")
         self.assertNotIn("secret provider response", str(payload))
+
+
+class PlaybackEchoTests(unittest.TestCase):
+    def test_greeting_fragment_is_echo(self):
+        spoken = "Thanks for calling Aurora Hotel reservations. How can I help?"
+        self.assertTrue(_is_probable_playback_echo("Thanks for", spoken))
+
+    def test_welcome_fragment_of_the_last_reply_is_echo(self):
+        spoken = "You're welcome! Is there anything else I can help you with?"
+        self.assertTrue(_is_probable_playback_echo("Welcome.", spoken))
+
+    def test_real_interruption_is_kept(self):
+        spoken = (
+            "You may cancel without charge until 6:00 PM local hotel time "
+            "two days before arrival."
+        )
+        self.assertFalse(_is_probable_playback_echo("Wait, speak Tamil.", spoken))
+
+    def test_check_in_question_is_kept(self):
+        spoken = "Puede cancelar sin cargo hasta las 6:00 PM."
+        self.assertFalse(_is_probable_playback_echo("What time is check-in?", spoken))
+
+    def test_near_duplicate_reply_is_echo(self):
+        spoken = "Check-in starts at 3:00 PM and check-out is at 11:00 AM."
+        self.assertTrue(
+            _is_probable_playback_echo(
+                "Check-in starts at 3 PM and check-out is at 11 AM",
+                spoken,
+            )
+        )
+
+
+class StaticCacheTests(unittest.TestCase):
+    def test_web_assets_are_uncached(self):
+        self.assertTrue(static_no_store("/"))
+        self.assertTrue(static_no_store("/web/talk.js"))
+        self.assertTrue(static_no_store("/web/index.html?v=1"))
+        self.assertFalse(static_no_store("/token"))
+        self.assertFalse(static_no_store("/state"))
 
 
 class ListenAddressTests(unittest.TestCase):
