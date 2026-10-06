@@ -327,8 +327,8 @@ def _is_probable_playback_echo(
 ) -> bool:
     """Ignore audio that is only Aurora's own speaker playback coming back.
 
-    A real interruption such as "Wait, speak Tamil" or a courtesy "நன்றி" is kept.
-    Near-duplicate STT of the line Aurora just spoke is treated as echo.
+    A real interruption such as "Wait, speak Tamil", "Standard Queen", or "Yes" is kept.
+    Only near-duplicate STT of the line Aurora spoke without caller input is treated as echo.
     """
     normalized = _normalize_utterance(transcript)
     if not normalized:
@@ -347,24 +347,29 @@ def _is_probable_playback_echo(
     if not spoken_norm:
         return False
 
+    if barge_in:
+        # Deliberate barge-in: Caller answers/interrupts with choices like "Standard Queen",
+        # "ocean view", "yes", "stop", "wait". Never drop answers or short phrases.
+        if len(normalized) < 30 or len(normalized.split()) < 6:
+            return False
+        # Only suppress if the caller audio was pure speaker bleed matching the entire reply:
+        return SequenceMatcher(None, normalized, spoken_norm).ratio() >= 0.88
+
+    # Non-barge-in turns:
     # Exact / near copy of the full reply (true speaker echo).
-    if SequenceMatcher(None, normalized, spoken_norm).ratio() >= (0.88 if barge_in else 0.78):
+    if SequenceMatcher(None, normalized, spoken_norm).ratio() >= 0.78:
         return True
 
     # Contiguous fragment of the reply (avoid single shared topic words).
-    if len(normalized) >= 8 and normalized in spoken_norm:
+    if len(normalized) >= 12 and normalized in spoken_norm:
         return True
 
     t_words = [w for w in normalized.split() if len(w) > 1]
     s_words = set(spoken_norm.split())
-    if t_words and s_words and len(t_words) <= 10:
+    if t_words and s_words and len(t_words) <= 6:
         matching = sum(1 for w in t_words if w in s_words)
-        # Barge-in needs almost all tokens from the reply; topic words alone must not drop.
         overlap = matching / len(t_words)
-        if barge_in:
-            if len(t_words) >= 4 and overlap >= 0.9:
-                return True
-        elif len(t_words) <= 6 and overlap >= 0.85:
+        if overlap >= 0.85:
             return True
 
     for piece in spoken_norm.replace("?", ".").split("."):
@@ -372,10 +377,7 @@ def _is_probable_playback_echo(
         if len(piece) < 16:
             continue
         ratio = SequenceMatcher(None, normalized, piece).ratio()
-        if barge_in:
-            if ratio >= 0.9 or (len(normalized) >= 16 and normalized in piece):
-                return True
-        elif normalized in piece or piece in normalized or ratio >= 0.85:
+        if normalized in piece or piece in normalized or ratio >= 0.85:
             return True
     return False
 

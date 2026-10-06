@@ -137,6 +137,17 @@ class PlaybackEchoTests(unittest.TestCase):
             _is_probable_playback_echo("What about cancellation?", spoken, barge_in=True)
         )
 
+        options = (
+            "We have a Standard Queen for $189 per night and a Deluxe King for $229. "
+            "Which would you like?"
+        )
+        # Caller interrupting to answer must never be dropped as echo
+        self.assertFalse(_is_probable_playback_echo("Standard Queen", options, barge_in=True))
+        self.assertFalse(_is_probable_playback_echo("Deluxe King", options, barge_in=True))
+        self.assertFalse(_is_probable_playback_echo("Yes", options, barge_in=True))
+        self.assertFalse(_is_probable_playback_echo("No", options, barge_in=True))
+
+
 
 class StaticCacheTests(unittest.TestCase):
     def test_web_assets_are_uncached(self):

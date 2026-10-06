@@ -50,6 +50,7 @@ let recordingStartedAt = 0;
 let lastSpeechAt = 0;
 let speechCandidateAt = 0;
 let bargeCandidateAt = 0;
+let lastBargeHitAt = 0;
 let listenCooldownUntil = 0;
 let agentBusy = false;
 let agentSpeaking = false;
@@ -77,36 +78,37 @@ const clientEvents = [];
 const tuning = {
   endpointSilenceMs: Number(endpointControl?.value || 650),
   sensitivity: 3.2,
-  minTurnMs: 450,
-  speechConfirmationMs: 140,
-  bargeInConfirmationMs: 280,
-  bargeInArmMs: 350,
-  bargeEchoMultiple: 2.2,
-  postPlaybackHoldMs: 700,
-  afterPlaybackEchoMs: 2000,
-  playbackVolume: 0.55,
+  minTurnMs: 400,
+  speechConfirmationMs: 130,
+  bargeInConfirmationMs: 130,
+  bargeInArmMs: 140,
+  bargeEchoMultiple: 1.25,
+  postPlaybackHoldMs: 500,
+  afterPlaybackEchoMs: 1500,
+  playbackVolume: 0.35,
   maxTurnMs: 25000,
 };
 
 function applyAudioMode(mode) {
   audioMode = mode;
   if (mode === "speaker") {
-    // Soft TTS + floor-relative barge so a normal voice can cut in on speakers.
-    tuning.speechConfirmationMs = 140;
-    tuning.bargeInConfirmationMs = 180;
-    tuning.bargeInArmMs = 220;
-    tuning.postPlaybackHoldMs = 650;
-    tuning.afterPlaybackEchoMs = 1800;
-    tuning.bargeEchoMultiple = 1.55;
-    tuning.playbackVolume = 0.32;
+    // Tuned for laptop speaker: responsive voice interruption with acoustic echo rejection.
+    tuning.speechConfirmationMs = 130;
+    tuning.bargeInConfirmationMs = 130;
+    tuning.bargeInArmMs = 140;
+    tuning.postPlaybackHoldMs = 500;
+    tuning.afterPlaybackEchoMs = 1500;
+    tuning.bargeEchoMultiple = 1.25;
+    tuning.playbackVolume = 0.35;
     if (audioModeValue) audioModeValue.textContent = "Laptop Speaker";
   } else {
-    tuning.speechConfirmationMs = 110;
-    tuning.bargeInConfirmationMs = 160;
-    tuning.bargeInArmMs = 120;
-    tuning.postPlaybackHoldMs = 220;
-    tuning.afterPlaybackEchoMs = 800;
-    tuning.bargeEchoMultiple = 1.45;
+    // Tuned for headset: ultra-responsive barge-in with no speaker echo penalty.
+    tuning.speechConfirmationMs = 100;
+    tuning.bargeInConfirmationMs = 95;
+    tuning.bargeInArmMs = 80;
+    tuning.postPlaybackHoldMs = 150;
+    tuning.afterPlaybackEchoMs = 500;
+    tuning.bargeEchoMultiple = 1.15;
     tuning.playbackVolume = 1;
     if (audioModeValue) audioModeValue.textContent = "Headset";
   }
@@ -350,33 +352,30 @@ function speak(text, locale = "en-US", audioBase64 = "", audioContentType = "aud
 
 function forceInterrupt() {
   if (!listenStream) return;
-  // speechSynthesis may be audible before utterance.onstart flips agentSpeaking.
-  if (!agentSpeaking && "speechSynthesis" in window && window.speechSynthesis.speaking) {
-    agentSpeaking = true;
-    agentRoot.classList.add("speaking");
-    setInterruptEnabled(true);
-  }
-  if (!agentSpeaking && !agentBusy) return;
+  const isSpeaking = agentSpeaking
+    || ("speechSynthesis" in window && window.speechSynthesis.speaking)
+    || Boolean(activeAgentAudio);
+
+  if (!isSpeaking && !agentBusy) return;
   const detectedAt = Date.now();
   appendRuntimeEvent("barge_in.manual");
-  if (agentSpeaking) {
-    interruptAgent(detectedAt, false);
+  interruptAgent(detectedAt, false);
+  if (!recorder) {
     startTurnRecording(true);
-    lastSpeechAt = detectedAt;
   }
+  lastSpeechAt = detectedAt;
 }
 
 function interruptAgent(detectedAt, turnAlreadyRecording = false) {
-  if (!agentSpeaking) return;
   stopAgentPlayback();
   agentSpeaking = false;
   agentRoot.classList.remove("speaking");
   setInterruptEnabled(false);
   playbackEndedAt = Date.now();
-  listenCooldownUntil = Date.now() + 80;
+  listenCooldownUntil = 0;
   pendingBargeInTurn = !turnAlreadyRecording;
   pendingBargeDetectedAt = detectedAt;
-  setListeningState("Interrupted", "Aurora stopped. Listening to the caller.");
+  setListeningState("Interrupted", "Aurora stopped. Listening to your answer.");
 }
 
 function commitBargeIn(detectedAt) {
@@ -397,48 +396,38 @@ function audioLevel() {
 
 function thresholds() {
   const start = Math.min(0.09, Math.max(0.012, noiseFloor * tuning.sensitivity));
-  if (audioMode === "speaker") {
-    // Gate on echo floor only — tracking peak made barge impossible while TTS played.
-    const barge = Math.min(
-      0.085,
-      Math.max(0.04, start * 1.7, playbackEchoFloor * tuning.bargeEchoMultiple),
-    );
+  if (audioMode === "headset") {
+    // In headphones, no speaker echo enters the mic. A normal voice easily interrupts.
+    const barge = Math.max(0.015, start * 1.15);
     return {
       start,
-      end: Math.max(0.008, start * 0.58),
+      end: Math.max(0.006, start * 0.52),
       barge,
     };
   }
 
+  // Speaker mode:
+  // Echo floor tracks Aurora's speaker bleed. Normal speech will rise ~20-30% above the floor.
   const barge = Math.min(
-    0.09,
-    Math.max(0.03, start * 1.5, playbackEchoFloor * tuning.bargeEchoMultiple),
+    0.065,
+    Math.max(0.022, start * 1.25, playbackEchoFloor * 1.25 + 0.004),
   );
   return {
     start,
-    end: Math.max(0.008, start * 0.55),
+    end: Math.max(0.007, start * 0.55),
     barge,
   };
 }
 
 function duckAgentPlayback() {
   if (activeAgentAudio) {
-    activeAgentAudio.volume = Math.min(tuning.playbackVolume, 0.12);
-    return;
-  }
-  // Browser TTS cannot change volume mid-utterance; pause is the duck.
-  if ("speechSynthesis" in window && window.speechSynthesis.speaking) {
-    try { window.speechSynthesis.pause(); } catch { /* ignore */ }
+    activeAgentAudio.volume = Math.min(tuning.playbackVolume * 0.3, 0.12);
   }
 }
 
 function restoreAgentPlaybackVolume() {
   if (activeAgentAudio) {
     activeAgentAudio.volume = tuning.playbackVolume;
-    return;
-  }
-  if ("speechSynthesis" in window && window.speechSynthesis.paused) {
-    try { window.speechSynthesis.resume(); } catch { /* ignore */ }
   }
 }
 
@@ -469,8 +458,9 @@ function startTurnRecording(isBargeIn = false) {
     recordedChunks = [];
     callerRoot.classList.remove("speaking");
     const limit = thresholds();
-    const isTooQuiet = !wasBargeIn && maxLevel < limit.start * 1.15;
-    if (shouldDiscard || audioBlob.size < 1200 || isTooQuiet) {
+    const isTooQuiet = !wasBargeIn && maxLevel < limit.start * 1.1;
+    const minBlobSize = wasBargeIn ? 300 : 500;
+    if (shouldDiscard || audioBlob.size < minBlobSize || isTooQuiet) {
       currentTurnWasBargeIn = false;
       if (agentSpeaking) {
         setListeningState("Agent speaking", "Interrupt naturally by speaking over Aurora.");
@@ -643,13 +633,16 @@ function vadLoop() {
       playbackEchoPeak *= 0.98;
     }
     const liveLimit = thresholds();
-    // Relative spike over the learned floor (works when TTS and voice overlap).
-    const relativeSpike = smoothedLevel > playbackEchoFloor * 1.45 + 0.012;
+    // In speaker mode, a voice adds acoustic energy on top of the speaker echo floor.
+    const relativeSpike = smoothedLevel > (playbackEchoFloor * 1.22 + 0.004);
     const bargeHit = smoothedLevel > liveLimit.barge || (audioMode === "speaker" && relativeSpike);
+
     if (playbackAge < tuning.bargeInArmMs) {
       bargeCandidateAt = 0;
+      lastBargeHitAt = 0;
       bargeRecordingCandidate = false;
     } else if (bargeHit) {
+      lastBargeHitAt = now;
       if (!bargeCandidateAt) {
         bargeCandidateAt = now;
         bargeRecordingCandidate = true;
@@ -658,22 +651,29 @@ function vadLoop() {
       }
       if (now - bargeCandidateAt >= tuning.bargeInConfirmationMs) {
         bargeRecordingCandidate = false;
-        interruptAgent(bargeCandidateAt, false);
+        const candidateStart = bargeCandidateAt;
+        bargeCandidateAt = 0;
+        lastBargeHitAt = 0;
+        interruptAgent(candidateStart, false);
         startTurnRecording(true);
         lastSpeechAt = now;
-        bargeCandidateAt = 0;
       }
     } else {
-      if (bargeRecordingCandidate) {
-        bargeRecordingCandidate = false;
-        appendRuntimeEvent("barge_in.candidate_dropped");
-        restoreAgentPlaybackVolume();
+      // Hangover window: keep candidate alive across brief phoneme dips (~140ms)
+      const hangoverActive = bargeCandidateAt && (now - lastBargeHitAt < 140);
+      if (!hangoverActive) {
+        if (bargeRecordingCandidate) {
+          bargeRecordingCandidate = false;
+          appendRuntimeEvent("barge_in.candidate_dropped");
+          restoreAgentPlaybackVolume();
+        }
+        bargeCandidateAt = 0;
+        lastBargeHitAt = 0;
       }
-      bargeCandidateAt = 0;
     }
   } else if (!agentBusy && !muted) {
-    if (now <= listenCooldownUntil) {
-      if (audioMode === "headset" && smoothedLevel > limit.start * 1.4) {
+    if (!recorder && now <= listenCooldownUntil) {
+      if (audioMode === "headset" && smoothedLevel > limit.start * 1.2) {
         // Headphones: allow speaking through a short post-playback hold.
         listenCooldownUntil = 0;
         speechCandidateAt = speechCandidateAt || now;
