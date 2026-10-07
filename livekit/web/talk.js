@@ -63,10 +63,11 @@ let pendingBargeDetectedAt = 0;
 const clientEvents = [];
 
 const tuning = {
-  endpointSilenceMs: Number(endpointControl?.value || 650),
+  endpointSilenceMs: Number(endpointControl?.value || 1000),
   sensitivity: 3.2,
   minTurnMs: 400,
   speechConfirmationMs: 130,
+  speechHangoverMs: 220,
   bargeInConfirmationMs: 130,
   bargeInArmMs: 140,
   bargeEchoMultiple: 1.25,
@@ -75,6 +76,14 @@ const tuning = {
   playbackVolume: 0.35,
   maxTurnMs: 25000,
 };
+
+/** Longer multi-clause answers need more pause room than short yes/no replies. */
+function effectiveEndpointSilenceMs(turnDurationMs) {
+  const base = tuning.endpointSilenceMs;
+  if (turnDurationMs < 1500) return base;
+  const extra = Math.min(550, Math.floor((turnDurationMs - 1500) * 0.28));
+  return base + extra;
+}
 
 function resetListeningCalibration(reason = "mode_change") {
   // Speaker bleed can inflate the floor; switching to headset must not keep that gate.
@@ -358,7 +367,7 @@ function thresholds() {
     const barge = Math.max(0.011, start * 1.08);
     return {
       start,
-      end: Math.max(0.004, start * 0.48),
+      end: Math.max(0.003, start * 0.4),
       barge,
     };
   }
@@ -372,7 +381,8 @@ function thresholds() {
   );
   return {
     start,
-    end: Math.max(0.007, start * 0.55),
+    // Keep end lower than start so quieter mid-phrase syllables still count as speech.
+    end: Math.max(0.005, start * 0.42),
     barge,
   };
 }
@@ -651,13 +661,21 @@ function vadLoop() {
       }
     } else {
       turnMaxLevel = Math.max(turnMaxLevel, smoothedLevel);
-      if (smoothedLevel > limit.end) lastSpeechAt = now;
+      // Hangover keeps brief dips between words/clauses from starting the silence clock.
+      const speechEnergy = smoothedLevel > limit.end
+        || (smoothedLevel > limit.end * 0.55 && now - lastSpeechAt < tuning.speechHangoverMs);
+      if (speechEnergy) lastSpeechAt = now;
       const duration = now - recordingStartedAt;
+      const silenceNeeded = effectiveEndpointSilenceMs(duration);
       const endpointReached = duration >= tuning.minTurnMs
-        && now - lastSpeechAt >= tuning.endpointSilenceMs;
+        && now - lastSpeechAt >= silenceNeeded;
       if (endpointReached || duration >= tuning.maxTurnMs) {
         lastEndpointAt = Date.now();
-        appendRuntimeEvent(endpointReached ? "vad.endpoint_detected" : "vad.max_turn_reached");
+        appendRuntimeEvent(
+          endpointReached
+            ? `vad.endpoint_detected | silence ${silenceNeeded}ms`
+            : "vad.max_turn_reached",
+        );
         stopTurnRecording();
       }
     }

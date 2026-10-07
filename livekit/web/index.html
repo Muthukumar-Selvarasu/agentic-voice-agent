@@ -9,10 +9,7 @@
   <body>
     <main>
       <header class="header">
-        <div>
-          <p class="eyebrow">Local LiveKit session</p>
-          <h1>Aurora Voice Operations</h1>
-        </div>
+        <h1>Aurora Voice Operations</h1>
         <div class="header-state">
           <span class="status-pill" id="language">English</span>
           <span class="status-pill" id="provider">Provider: loading</span>
@@ -26,8 +23,8 @@
           <span id="vad-readout">Calibrating</span>
         </div>
         <label class="tuning-cell">
-          <span>Endpoint silence <strong id="endpoint-value">650 ms</strong></span>
-          <input id="endpoint-control" type="range" min="350" max="3000" step="50" value="650" />
+          <span>Endpoint silence <strong id="endpoint-value">1000 ms</strong></span>
+          <input id="endpoint-control" type="range" min="350" max="3000" step="50" value="1000" />
         </label>
         <label class="tuning-cell">
           <span>Speech sensitivity <strong id="sensitivity-value">3.2x</strong></span>
@@ -45,35 +42,33 @@
       <section class="stage" aria-label="LiveKit call participants">
         <article class="participant-card" data-client="caller">
           <div class="card-top">
-            <div>
-              <p class="eyebrow">Caller</p>
-              <h2>Caller</h2>
-            </div>
+            <h2>Caller</h2>
             <span class="state" data-role="status">Ready</span>
           </div>
-          <div class="waveform caller-wave" aria-hidden="true">
-            <span></span><span></span><span></span><span></span><span></span>
-          </div>
-          <div class="call-controls">
-            <button id="start-call" type="button">Start call</button>
-            <button id="interrupt-call" type="button" class="secondary interrupt" disabled>Interrupt</button>
-            <button id="mute-call" type="button" class="secondary" disabled>Mute</button>
-            <button id="end-call" type="button" class="danger" disabled>End call</button>
+          <div class="card-body">
+            <div class="waveform caller-wave" aria-hidden="true">
+              <span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <div class="call-controls">
+              <button id="start-call" type="button">Start call</button>
+              <button id="interrupt-call" type="button" class="secondary interrupt" disabled>Interrupt</button>
+              <button id="mute-call" type="button" class="secondary" disabled>Mute</button>
+              <button id="end-call" type="button" class="danger" disabled>End call</button>
+            </div>
           </div>
         </article>
 
         <article class="participant-card agent" data-client="agent">
           <div class="card-top">
-            <div>
-              <p class="eyebrow">Voice agent</p>
-              <h2>Aurora Agent</h2>
-            </div>
+            <h2>Aurora Agent</h2>
             <span class="state" data-role="status">Waiting</span>
           </div>
-          <div class="waveform agent-wave" aria-hidden="true">
-            <span></span><span></span><span></span><span></span><span></span>
+          <div class="card-body">
+            <div class="waveform agent-wave" aria-hidden="true">
+              <span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <div id="voice-status" class="voice-status">Start the call, then speak naturally</div>
           </div>
-          <div id="voice-status" class="voice-status">Start the call, then speak naturally</div>
         </article>
       </section>
 
