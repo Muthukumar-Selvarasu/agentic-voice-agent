@@ -12,6 +12,13 @@ pip install -r requirements.txt
 npm install
 ```
 
+Install FFmpeg on the talk-server host (for example, `brew install ffmpeg` on
+macOS). It decodes browser WebM/MP4/Opus for local speech detection. The Python
+requirements install the CPU ONNX runtime; the pinned Silero weights and MIT
+license are bundled in `vad_models/`, with no model download at runtime. A
+compatible mono 16 kHz WAV needs no external decoder. If detection is unavailable,
+audio remains eligible for transcription and `vad.evidence.available` is false.
+
 ## Run
 
 Terminal 1:
@@ -60,7 +67,7 @@ Override these values in `livekit/.env` when using another server. The scripts a
 
 `PROVIDER=openai` or `PROVIDER=groq` transcribes the recorded browser turn and runs the live hotel agent. `PROVIDER=mock` uses scripted transcripts, deterministic tools, and no paid calls.
 
-`TTS_BACKEND=provider` generates WAV audio through the selected provider using `TTS_MODEL` and `TTS_VOICE`. `TTS_BACKEND=system` uses browser speech synthesis in the LiveKit UI and avoids provider TTS cost. The browser falls back to its installed voice if provider synthesis or playback fails.
+`TTS_BACKEND=provider` generates WAV audio through the selected provider using `TTS_MODEL` and `TTS_VOICE`. `TTS_BACKEND=system` renders the installed macOS voice into a WAV for controllable browser playback and avoids provider TTS cost. Unsupported hosts and rendering failures use browser speech synthesis. The browser also falls back to its installed voice if provider synthesis or playback fails.
 
 The talk server stores independent agent state per browser session and writes structured telemetry to `../logs/voice-events.jsonl`.
 
@@ -88,7 +95,7 @@ The local commands above stay the in-person demo. Railway is a separate public U
 
 `talk_server.py` keeps `localhost:5173` unless the platform sets `PORT` and `TALK_PORT` is unset. In that case it binds `0.0.0.0` and Railway's `PORT`. A public bind refuses to start while LiveKit is still the local `ws://` dev server or the dev key pair, while `PROVIDER` is `mock`, or while `TELEMETRY_INCLUDE_CONTENT=true`. The refusal names the missing settings and does not print secret values.
 
-Put `LIVEKIT_URL` (`wss`), `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_ROOM`, `PROVIDER`, and the matching API key in Railway variables. Use `TTS_BACKEND=provider` for provider audio, or `TTS_BACKEND=system` for browser speech. On this server, `system` selects the browser voice and does not call macOS `say`. Do not deploy until those variables are set. Booking tools stay mocks.
+Put `LIVEKIT_URL` (`wss`), `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_ROOM`, `PROVIDER`, and the matching API key in Railway variables. Use `TTS_BACKEND=provider` for provider audio, or `TTS_BACKEND=system` for system speech. On macOS, this server renders system speech into a temporary WAV with `say` and sends it to browser audio playback; rendering does not play sound on the server. English, Spanish, and Tamil use Samantha, Mónica, and Vani respectively. Other hosts, unavailable voices, and render failures fall back to browser speech. Do not deploy until those variables are set. Booking tools stay mocks.
 
 ## Troubleshooting
 
@@ -103,3 +110,139 @@ Put `LIVEKIT_URL` (`wss`), `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_ROO
 | Turns feel slow | Decrease Endpoint silence carefully |
 | No real transcription in mock mode | Set a live provider in `pipeline/.env` |
 | Voice still sounds like the system voice | Set `TTS_BACKEND=provider`, restart `talk_server.py`, and confirm the UI shows `TTS: <voice>` |
+
+## Speaker interruption check
+
+With the patched browser page, start a call using laptop speakers and leave the
+caller silent during the greeting and a longer answer. Repeat at the speaker
+volumes used in the demo. Aurora should finish each answer without a second
+caller turn. Then say "Wait, speak Tamil" over a longer answer; Aurora should
+stop and respond to the caller. Repeat with headphones. If provider TTS is
+configured, repeat the speaker check with that backend as well.
+
+In the browser console, `window.__auroraTalk.state()` shows the capture track's
+reported `echoCancellation` setting and current playback state.
+`window.__auroraTalk.clientEvents()` distinguishes `barge_in.check_started`,
+`barge_in.resumed`, `barge_in.speech_confirmed`, and `tts.playback_error`.
+Echo checks use the same STT model while output continues; a rejected echo
+candidate must produce no audible pause or agent reply. A real interruption
+should produce `barge_in.speech_confirmed` (including onset-to-pause milliseconds)
+and a caller transcript. Capture starts on the first raw microphone hit and
+continues during the check. Preview windows normally take 900 ms, or at least
+400 ms for a brief utterance followed by silence, plus the STT round trip.
+The listener clock also checks this deadline: some encoders stop delivering
+timeslice chunks during silence, so chunk callbacks alone can strand a brief
+"no" candidate indefinitely. Muting discards open caller recordings instead
+of joining speech from before and after the mute.
+Measure the resulting latency on the actual device before calling it natural
+talk-over. `barge_in.pause_acknowledged | false` means the browser failed to
+pause native synthesis; the candidate is discarded without claiming an
+interruption. Local macOS system speech uses browser audio to support pause and
+resume at the same position. The native browser fallback still needs separate
+hardware validation. A `tts.playback_error`
+indicates an output failure rather than microphone detection. Browser track
+settings and synthetic tests cannot verify physical echo cancellation; record
+browser, microphone, output device, volume, and TTS backend with observations.
+
+The listener resets speech candidates across long render gaps and ignores
+suspended or stalled audio contexts. Recorded preview audio is preserved across
+render gaps. Where the track advertises support, cancellation of all system
+playout is requested for native browser TTS. Before transcription, recorded audio
+is decoded and effectively silent clips are discarded; any audible 20 ms window
+keeps a short reply eligible. If the browser cannot decode its recording format,
+the existing transcription path remains available. The server then runs a local
+Silero detector before external transcription: any 32 ms frame with speech
+probability at least 0.3 keeps the clip eligible, without a minimum word count
+or speech duration. A clip with no qualifying frames is ignored before STT,
+reasoning, or TTS. Local speech evidence takes precedence over Whisper's
+confidence metadata, which can label noise as confidently recognized speech.
+When local detection is unavailable, the conservative fallback rejects a clip
+only if every Whisper segment reports high silence probability and weak text
+confidence. These checks keep the configured reasoning model, transcription
+model, and TTS backend.
+
+Whisper can still report zero silence probability for an entirely silent clip;
+its confidence field alone does not establish that a caller spoke.
+Live native-synthesis trials also produced novel false transcripts during
+speaker echo, so transcript matching alone has not established a passing
+silent-caller check. With the interfering Codex voice session ended, a local
+in-app-browser trial using macOS WAV playback completed its 4-second greeting
+and 54-second reply with no recorder activity or extra turns, including
+26 seconds after the long reply. This covers the current laptop-speaker setup
+at the app's 0.3 playback volume; other physical volumes and headphones remain
+unverified. Later physical-microphone trials produced novel false transcripts
+from room noise, so that one passing trial does not establish acceptance.
+The integrated local detector rejects five saved problem clips offline (peak
+speech probabilities 0.047–0.155), while retaining generated faint English and
+Tamil one-word speech. A fresh trial with the integrated filter used Chrome
+155, the built-in MacBook Pro microphone, requested echo/noise cancellation
+and gain control, laptop speakers, and the app's 0.3 speaker playback volume.
+The 4-second greeting and 29-second answer both finished naturally, with no
+confirmed interruption or extra reply through 94 seconds after the greeting
+and 82 seconds after the answer. Captured room-noise candidates were rejected
+locally before STT. This establishes a bounded result on that setup; physical
+human talk-over, other volumes/devices, headphones, and native fallback remain
+unverified.
+
+A separate temporary browser fixture supplied generated PCM as microphone
+input, using the actual MediaRecorder, LiveKit connection, configured Groq
+Whisper endpoint, reasoning model, and system audio output. "Wait, speak Tamil",
+"Standard Queen" (also present in the playing answer), and the brief "No" all
+paused output and retained their complete transcripts. Recorded onset-to-pause
+times were 2.2, 1.9, and 1.3 seconds respectively. These are synthetic microphone
+tests, not proof of genuine caller speech through the physical microphone;
+the STT confirmation delay also needs usability assessment on real calls.
+Repeating these recorder tests with the integrated neural filter preserved all
+three complete caller transcripts and acknowledged playback pauses. Current
+onset-to-pause times were 2.5 seconds for "No", 2.6 seconds for "Standard Queen",
+and 1.1 seconds for "Wait, speak Tamil". Separate real-Groq checks retained all
+ten generated English, Tamil and Spanish clips attenuated to 0.1 and 0.03 of
+their rendered amplitude; these were generated test speech, not replays of
+saved microphone recordings.
+
+While recording, the browser checks the growing clip against the local detector
+every 500 ms using `/speech-activity`. This endpoint does not invoke STT, reasoning,
+or TTS. The last qualifying speech frame sets the silence timer, so persistent
+room noise cannot hold a completed utterance open. A failed or unavailable local
+check falls back to energy endpointing; requests time out after two seconds.
+The default silence wait is 1,000 ms, with up to 550 ms extra for longer speech.
+Late preview confirmation does not restart that wait. Ordinary capture starts
+on the first microphone hit, and an early rejected preview can retry the same
+recording twice to retain a short caller's first word. Final transcription still
+covers the complete recording because the caller may continue after the preview.
+Short callers
+repeating a room choice or saying "no"/"wait" remain eligible, but verbatim
+long repetitions of the currently playing reply are acoustically ambiguous
+with speaker echo and still need hardware verification.
+
+A human retest exposed recordings lasting 6.84–24.96 seconds despite only
+1.15–1.92 seconds of detected speech in representative clips. That was an
+endpoint delay caused by noise, beyond the intentional silence wait. In the
+subsequent generated microphone check, "No" followed by ten seconds of continuous
+noise paused output after 1.14 seconds and closed its recording after 1.47 seconds.
+The final request took 2.88 seconds: approximately 39 ms for local detection,
+396 ms for STT, 1,532 ms for reasoning, and 905 ms for system speech rendering.
+An ordinary "Wait, speak Tamil" retained its complete transcript, ended about
+1.01 seconds after the last detected speech frame, and began its response
+2.80 seconds after endpointing. These generated checks support the endpoint
+repair. The user subsequently accepted the physical-microphone retest and
+authorized closing FDE-243. Other volumes, devices, and native synthesis remain
+unverified.
+
+For timing diagnostics, inspect the VAD readout's `data-last-barge-timings` and
+`data-last-turn-timings` attributes. They separate onset-to-check/pause,
+endpoint-after-speech, request time, server stages, and endpoint-to-first-audio.
+The server trace also records the submitted client timings when telemetry is
+configured; content logging is not needed for these measurements.
+
+Playback is armed before audio starts, with a watchdog for missing end events.
+Confirmed speech suspends that watchdog while the caller's turn is processed;
+rejected final transcription resumes the same audio position and the remaining
+watchdog time. Native synthesis retries an asynchronous cancellation once, with
+token checks to prevent a replaced reply from being replayed. The Start gesture
+unlocks audio output, and recorder start failures leave the listener available.
+
+Offline regressions: `node --test livekit/test_talk_browser.cjs` and
+`livekit/.venv/bin/python -m unittest discover -s livekit -p 'test_*.py'` from
+the repository root, after installing the requirements. The acoustic tests use
+bundled synthetic WAVs and run locally without sound output or external STT.

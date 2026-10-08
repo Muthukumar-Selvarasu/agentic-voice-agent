@@ -1,2 +1,4 @@
 livekit-api
 openai>=1.30
+onnxruntime==1.30.0
+numpy>=1.24

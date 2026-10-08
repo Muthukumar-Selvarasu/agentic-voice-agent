@@ -7,10 +7,16 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import warnings
+import unicodedata
+import wave
 from difflib import SequenceMatcher
 from io import BytesIO
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -170,10 +176,50 @@ def _finish_response(agent, trace, reply: str, action: str | None, **extra) -> d
     }
 
 
+def _system_tts_audio(text: str, locale: str) -> tuple[bytes, str] | None:
+    """Render the configured macOS system voice without playing it on the host.
+
+    Browser audio gives capture processing a browser playout source and supports
+    exact pause/resume. Native speechSynthesis failed to pause in the live embed.
+    Other hosts keep the existing browser voice fallback.
+    """
+    if sys.platform != "darwin":
+        return None
+    command = shutil.which(os.getenv("SYSTEM_TTS_CMD", "say"))
+    if not command:
+        return None
+    voice = {"en": "Samantha", "es": "Mónica", "ta": "Vani"}.get(locale.split("-")[0], "Samantha")
+    with tempfile.TemporaryDirectory(prefix="aurora-system-tts-") as directory:
+        output = Path(directory) / "speech.wav"
+        subprocess.run(
+            [command, "-v", voice, "-r", "176", "-o", str(output),
+             "--file-format=WAVE", "--data-format=LEI16@24000"],
+            input=text, text=True, capture_output=True, check=True, timeout=20,
+        )
+        with wave.open(str(output)) as recording:
+            if recording.getnframes() == 0:
+                raise ValueError("Empty system speech")
+        return output.read_bytes(), voice
+
+
 def _browser_tts_payload(agent, trace, text: str) -> dict:
     """Return provider audio for the browser or select its local voice fallback."""
     provider = agent.provider
     backend = getattr(provider, "tts_backend", "provider")
+    if backend == "system" and getattr(provider, "name", "") != "mock":
+        try:
+            with trace.span("tts", backend="system"):
+                rendered = _system_tts_audio(text, getattr(agent, "current_locale", "en-US"))
+            if rendered:
+                audio, voice = rendered
+                return {
+                    "ttsBackend": "system", "ttsVoice": voice,
+                    "audioContentType": "audio/wav",
+                    "audioBase64": base64.b64encode(audio).decode("ascii"),
+                }
+        except Exception as exc:
+            trace.event("tts.fallback", errorType=type(exc).__name__)
+        return {"ttsBackend": "browser", "ttsFallback": True}
     if backend != "provider" or getattr(provider, "name", "") == "mock":
         return {"ttsBackend": "browser"}
 
@@ -226,6 +272,53 @@ def _agent_reply(text: str, session_id: str, turn_id: str | None) -> dict:
     return _finish_response(agent, trace, reply, action, **tts)
 
 
+def _speech_evidence(audio: bytes) -> dict | None:
+    """Classify locally; keep unverified input when dependencies are unavailable."""
+    if len(audio) < 32:
+        return None
+    try:
+        from speech_detector import classify_audio
+        return classify_audio(audio)
+    except Exception:
+        return None
+
+
+def _is_confident_no_speech(stt, speech_evidence: dict | None = None) -> bool:
+    """Use local speech evidence, falling back to conservative STT metadata.
+
+    Without local evidence, missing metadata and any confident speech segment
+    keep the transcript, including short replies and non-English speech.
+    """
+    if speech_evidence is not None:
+        # Neural speech evidence takes precedence over STT confidence. Whisper
+        # confidently invents text for transient noise and even digital silence.
+        return speech_evidence["maxSpeechProbability"] < speech_evidence["speechThreshold"]
+    segments = getattr(stt, "segments", None)
+    if not segments:
+        return False
+    for segment in segments:
+        value = segment.get if isinstance(segment, dict) else lambda key: getattr(segment, key, None)
+        silence = value("no_speech_prob")
+        confidence = value("avg_logprob")
+        if not isinstance(silence, (int, float)) or not isinstance(confidence, (int, float)):
+            return False
+        if not (silence > 0.6 and confidence < -1.0):
+            return False
+    return True
+
+
+def _speech_activity_reply(audio: bytes, session_id: str, turn_id: str | None) -> dict:
+    """Local endpoint evidence only: never acquire an agent or invoke STT/TTS."""
+    trace = _trace(session_id, turn_id)
+    with trace.span("vad"):
+        evidence = _speech_evidence(audio)
+    trace.event("vad.activity", available=evidence is not None, **(evidence or {}))
+    from telemetry import write_trace
+    payload = trace.finish()
+    write_trace(payload)
+    return {"speechEvidence": evidence, "trace": payload}
+
+
 def _voice_agent_reply(
     audio: bytes,
     content_type: str,
@@ -233,15 +326,32 @@ def _voice_agent_reply(
     turn_id: str | None,
     was_barge_in: bool,
     after_playback: bool = False,
+    check_only: bool = False,
+    client_timings: dict | None = None,
 ) -> dict:
     agent, lock = _get_session(session_id)
     trace = _trace(session_id, turn_id)
     trace.event("audio.received", bytes=len(audio), contentType=content_type)
+    if client_timings:
+        trace.event("client.timing", **client_timings)
+    no_speech = False
+    speech_evidence = None
     with lock:
         if getattr(agent.provider, "name", "") == "mock":
             with trace.span("stt", model=getattr(agent.provider, "stt_model", "unknown")):
                 transcript = agent.provider.transcribe(b"")
         else:
+            with trace.span("vad"):
+                speech_evidence = _speech_evidence(audio)
+            trace.event("vad.evidence", available=speech_evidence is not None, **(speech_evidence or {}))
+            if speech_evidence is not None and _is_confident_no_speech(None, speech_evidence):
+                trace.event("stt.no_speech_suppressed", detector="silero")
+                return _finish_response(
+                    agent, trace, "", None, transcript="",
+                    sttModel=getattr(agent.provider, "stt_model", "unknown"),
+                    ignored=True, ignoreReason="no_speech", response_sources=[],
+                    speechEvidence=speech_evidence,
+                )
             audio_file = BytesIO(audio)
             if "mp4" in content_type:
                 audio_file.name = "caller.mp4"
@@ -253,20 +363,37 @@ def _voice_agent_reply(
                 transcription_args = {
                     "model": agent.provider.stt_model,
                     "file": audio_file,
-                    "response_format": "text",
+                    # Whisper exposes silence/confidence metadata without
+                    # changing the configured model. Other STT APIs keep text.
+                    "response_format": "verbose_json" if agent.provider.stt_model.startswith("whisper-") else "text",
                 }
                 stt_prompt = getattr(agent.provider, "stt_prompt", "")
                 if stt_prompt:
                     transcription_args["prompt"] = stt_prompt
                 stt = agent.provider.client.audio.transcriptions.create(**transcription_args)
             transcript = (stt if isinstance(stt, str) else stt.text).strip()
+            no_speech = _is_confident_no_speech(stt, speech_evidence)
+            segments = getattr(stt, "segments", None) or []
+            trace.event("stt.confidence", segments=[
+                {key: segment.get(key) if isinstance(segment, dict) else getattr(segment, key, None)
+                 for key in ("no_speech_prob", "avg_logprob")}
+                for segment in segments
+            ])
+        if no_speech:
+            trace.event("stt.no_speech_suppressed")
+            return _finish_response(
+                agent, trace, "", None,
+                transcript=transcript,
+                sttModel=getattr(agent.provider, "stt_model", "unknown"),
+                ignored=True, ignoreReason="no_speech", response_sources=[],
+            )
         # Speaker bleed often arrives as a normal turn right after TTS ends, not
         # only as an X-Barge-In interrupt. Suppress only clear playback copies —
         # never drop a deliberate barge-in / courtesy like "நன்றி".
-        if (was_barge_in or after_playback) and _is_probable_playback_echo(
+        if (was_barge_in or after_playback or check_only) and _is_probable_playback_echo(
             transcript,
             _last_spoken_text(session_id),
-            barge_in=was_barge_in,
+            barge_in=was_barge_in or check_only,
         ):
             trace.event(
                 "barge_in.echo_suppressed",
@@ -284,6 +411,15 @@ def _voice_agent_reply(
                 ignored=True,
                 ignoreReason="probable_playback_echo",
                 response_sources=[],
+                speechEvidence=speech_evidence,
+            )
+        if check_only:
+            trace.event("barge_in.input_confirmed")
+            return _finish_response(
+                agent, trace, "", None, transcript=transcript,
+                inputConfirmed=True, response_sources=[],
+                sttModel=getattr(agent.provider, "stt_model", "unknown"),
+                speechEvidence=speech_evidence,
             )
         if was_barge_in:
             trace.event("barge_in.turn_started")
@@ -302,7 +438,8 @@ def _voice_agent_reply(
 
 
 def _normalize_utterance(text: str) -> str:
-    stripped = text.lower()
+    stripped = unicodedata.normalize("NFKC", text.lower()).replace("’", "'")
+    stripped = "".join(" " if unicodedata.category(char) == "Pd" else char for char in stripped)
     for mark in ("'", ".", ",", "!", "?", "¡", "¿", "।", "…", ";", ":"):
         stripped = stripped.replace(mark, "")
     return " ".join(stripped.split())
@@ -372,6 +509,33 @@ def _is_probable_playback_echo(
         # Single-token bleed of a word Aurora just said (e.g. "hotel", "assist", "today").
         tokens = normalized.split()
         spoken_words = set(spoken_norm.split())
+        short_answers = {
+            "yes", "no", "wait", "stop", "tamil", "english", "hello", "hi",
+            "standard", "king", "queen", "suite", "family", "accessible",
+            "standard queen", "standard room", "king room", "family room",
+            "accessible room", "standard queen room", "deluxe king", "deluxe king room",
+            "ocean view", "garden view",
+        }
+        if normalized in short_answers:
+            return False
+        # A recorded preview is usually only part of the playing reply. The
+        # previous whole-reply-only comparison accepted those echo fragments.
+        # Novel interruption words must survive even when mixed with echo.
+        if any(word in {"wait", "stop", "tamil", "english"} and word not in spoken_words for word in tokens):
+            return False
+        if len(tokens) >= 2 and normalized in spoken_norm:
+            return True
+        if len(tokens) >= 3:
+            spoken_tokens = spoken_norm.split()
+            # Compare with local windows of the reply, including punctuation,
+            # number formatting and a small STT substitution. Comparing only
+            # with the complete reply missed partial echo such as "time is
+            # 11 a.m." and "could you let me know your name?".
+            for start in range(len(spoken_tokens)):
+                for width in range(max(2, len(tokens) - 2), len(tokens) + 3):
+                    fragment = " ".join(spoken_tokens[start:start + width])
+                    if fragment and SequenceMatcher(None, normalized, fragment).ratio() >= 0.88:
+                        return True
         if len(tokens) == 1 and tokens[0] in spoken_words and tokens[0] not in {
             "yes", "no", "wait", "stop", "tamil", "english", "hello", "hi",
         }:
@@ -490,7 +654,16 @@ class Handler(SimpleHTTPRequestHandler):
                 turn_id,
                 self.headers.get("X-Barge-In", "false").lower() == "true",
                 self.headers.get("X-After-Playback", "false").lower() == "true",
+                self.headers.get("X-Playback-Check", "false").lower() == "true",
             )
+        if parsed.path == "/speech-activity":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 1024 * 1024:
+                    raise ValueError("Invalid speech activity clip size")
+                return self._send_json(_speech_activity_reply(self.rfile.read(length), session_id, turn_id))
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=500)
         if parsed.path != "/agent":
             self.send_error(404, "File not found")
             return
@@ -514,12 +687,29 @@ class Handler(SimpleHTTPRequestHandler):
         turn_id: str | None,
         was_barge_in: bool = False,
         after_playback: bool = False,
+        check_only: bool = False,
     ) -> None:
         try:
             length = int(self.headers.get("Content-Length", "0"))
             audio = self.rfile.read(length)
             if not audio:
                 raise ValueError("Missing audio")
+            client_timings = {}
+            for name, header in (
+                ("captureMs", "X-Capture-Ms"),
+                ("onsetToCheckMs", "X-Onset-To-Check-Ms"),
+                ("onsetToPauseMs", "X-Onset-To-Pause-Ms"),
+                ("endpointAfterLastSpeechMs", "X-Endpoint-After-Speech-Ms"),
+            ):
+                try:
+                    value = float(self.headers.get(header, ""))
+                    if math.isfinite(value) and 0 <= value <= 120000:
+                        client_timings[name] = round(value, 1)
+                except ValueError:
+                    pass
+            method = self.headers.get("X-Endpoint-Method")
+            if method in {"silero", "energy"}:
+                client_timings["endpointMethod"] = method
             response = _voice_agent_reply(
                 audio,
                 self.headers.get("Content-Type", ""),
@@ -527,6 +717,8 @@ class Handler(SimpleHTTPRequestHandler):
                 turn_id,
                 was_barge_in,
                 after_playback,
+                check_only,
+                client_timings,
             )
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=500)

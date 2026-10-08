@@ -5,12 +5,22 @@ from __future__ import annotations
 import base64
 import os
 import unittest
+import threading
+import wave
+from pathlib import Path
+from io import BytesIO
+from types import SimpleNamespace
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import ANY, Mock, patch
 
 from talk_server import (
     _browser_tts_payload,
+    _system_tts_audio,
     _is_probable_playback_echo,
+    _is_confident_no_speech,
+    _speech_evidence,
+    _speech_activity_reply,
+    _voice_agent_reply,
     hosted_config_errors,
     listen_address,
     static_no_store,
@@ -63,10 +73,31 @@ class BrowserTtsPayloadTests(unittest.TestCase):
 
     def test_system_backend_selects_browser_voice_without_provider_call(self):
         provider = FakeProvider(backend="system")
-        payload = _browser_tts_payload(FakeAgent(provider), FakeTrace(), "Hello")
+        with patch("talk_server._system_tts_audio", return_value=None):
+            payload = _browser_tts_payload(FakeAgent(provider), FakeTrace(), "Hello")
 
-        self.assertEqual(payload, {"ttsBackend": "browser"})
+        self.assertEqual(payload, {"ttsBackend": "browser", "ttsFallback": True})
         self.assertEqual(provider.calls, [])
+
+    def test_system_backend_returns_local_audio_without_switching_provider(self):
+        provider = FakeProvider(backend="system")
+        agent = FakeAgent(provider)
+        agent.current_locale = "ta-IN"
+        with patch("talk_server._system_tts_audio", return_value=(b"RIFFlocal-wave", "Vani")) as render:
+            payload = _browser_tts_payload(agent, FakeTrace(), "வணக்கம்")
+        render.assert_called_once_with("வணக்கம்", "ta-IN")
+        self.assertEqual(payload["ttsBackend"], "system")
+        self.assertEqual(payload["ttsVoice"], "Vani")
+        self.assertEqual(base64.b64decode(payload["audioBase64"]), b"RIFFlocal-wave")
+        self.assertEqual(provider.calls, [])
+
+    def test_system_render_failure_keeps_browser_fallback_without_exposing_error(self):
+        trace = FakeTrace()
+        with patch("talk_server._system_tts_audio", side_effect=RuntimeError("private error")):
+            payload = _browser_tts_payload(FakeAgent(FakeProvider(backend="system")), trace, "Hello")
+        self.assertEqual(payload, {"ttsBackend": "browser", "ttsFallback": True})
+        self.assertEqual(trace.events[0][0], "tts.fallback")
+        self.assertNotIn("private error", str(payload))
 
     def test_provider_failure_falls_back_without_exposing_error(self):
         provider = FakeProvider(error=RuntimeError("secret provider response"))
@@ -78,7 +109,258 @@ class BrowserTtsPayloadTests(unittest.TestCase):
         self.assertNotIn("secret provider response", str(payload))
 
 
+class SystemSpeechRenderingTests(unittest.TestCase):
+    def test_renders_localized_wave_to_file_with_text_on_stdin_and_removes_temp_file(self):
+        for locale, expected_voice in (("en-US", "Samantha"), ("es-ES", "Mónica"), ("ta-IN", "Vani")):
+            with self.subTest(locale=locale):
+                outputs = []
+
+                def render(command, **kwargs):
+                    output = Path(command[command.index("-o") + 1])
+                    outputs.append(output)
+                    self.assertEqual(command[command.index("-v") + 1], expected_voice)
+                    self.assertIn("--file-format=WAVE", command)
+                    self.assertIn("--data-format=LEI16@24000", command)
+                    self.assertEqual(kwargs["input"], "Caller-controlled text $(not a shell command)")
+                    self.assertTrue(kwargs["check"])
+                    self.assertEqual(kwargs["timeout"], 20)
+                    with wave.open(str(output), "wb") as recording:
+                        recording.setnchannels(1)
+                        recording.setsampwidth(2)
+                        recording.setframerate(24000)
+                        recording.writeframes(b"\x01\x00" * 480)
+
+                with patch("talk_server.sys.platform", "darwin"), \
+                     patch("talk_server.shutil.which", return_value="/usr/bin/say"), \
+                     patch("talk_server.subprocess.run", side_effect=render) as run:
+                    audio, voice = _system_tts_audio("Caller-controlled text $(not a shell command)", locale)
+                self.assertEqual(voice, expected_voice)
+                self.assertEqual(audio[:4], b"RIFF")
+                run.assert_called_once()
+                self.assertFalse(outputs[0].parent.exists())
+
+    def test_empty_wave_is_rejected_and_cleaned_up(self):
+        outputs = []
+
+        def render(command, **kwargs):
+            output = Path(command[command.index("-o") + 1])
+            outputs.append(output)
+            with wave.open(str(output), "wb") as recording:
+                recording.setnchannels(1)
+                recording.setsampwidth(2)
+                recording.setframerate(24000)
+
+        with patch("talk_server.sys.platform", "darwin"), \
+             patch("talk_server.shutil.which", return_value="/usr/bin/say"), \
+             patch("talk_server.subprocess.run", side_effect=render):
+            with self.assertRaisesRegex(ValueError, "Empty system speech"):
+                _system_tts_audio("Hello", "en-US")
+        self.assertFalse(outputs[0].parent.exists())
+
+    def test_unsupported_host_or_missing_renderer_never_invokes_speech(self):
+        with patch("talk_server.subprocess.run") as run:
+            with patch("talk_server.sys.platform", "linux"):
+                self.assertIsNone(_system_tts_audio("Hello", "en-US"))
+            with patch("talk_server.sys.platform", "darwin"), \
+                 patch("talk_server.shutil.which", return_value=None):
+                self.assertIsNone(_system_tts_audio("Hello", "en-US"))
+            run.assert_not_called()
+
+
+class NoSpeechTests(unittest.TestCase):
+    def test_live_activity_endpoint_is_local_only_and_reports_last_speech(self):
+        audio = (Path(__file__).parent / "test_audio" / "synthetic_no_16k.wav").read_bytes()
+        with patch("talk_server._get_session") as session, patch.dict(os.environ, {"TELEMETRY_JSONL": ""}):
+            result = _speech_activity_reply(audio, "test", "activity-1")
+        session.assert_not_called()
+        self.assertGreater(result["speechEvidence"]["lastSpeechMs"], 0)
+        self.assertEqual(set(result["trace"]["timings"]), {"vad"})
+
+    def test_local_noise_evidence_overrides_even_confident_hallucinated_text(self):
+        stt = SimpleNamespace(segments=[{"no_speech_prob": 0.0, "avg_logprob": -0.2}])
+        evidence = {"maxSpeechProbability": 0.155, "speechThreshold": 0.3}
+        self.assertTrue(_is_confident_no_speech(stt, evidence))
+        self.assertFalse(_is_confident_no_speech(stt))
+
+    def test_local_speech_keeps_faint_no_or_tamil_even_with_bad_stt_metadata(self):
+        evidence = {"maxSpeechProbability": 0.92, "speechThreshold": 0.3}
+        for text in ("No.", "நன்றி", "Standard Queen"):
+            with self.subTest(text=text):
+                stt = SimpleNamespace(text=text, segments=[{"no_speech_prob": 0.99, "avg_logprob": -2.0}])
+                self.assertFalse(_is_confident_no_speech(stt, evidence))
+
+    def test_even_one_positive_frame_keeps_brief_input(self):
+        stt = SimpleNamespace(segments=[{"no_speech_prob": 0.0, "avg_logprob": -1.5}])
+        for duration in (32, 300, 4800):
+            with self.subTest(duration=duration):
+                self.assertFalse(_is_confident_no_speech(stt, {
+                    "durationMs": duration, "voicedMs": 32,
+                    "maxSpeechProbability": 0.3, "speechThreshold": 0.3}))
+
+    def test_real_detector_classifies_pcm_silence_without_external_decoder(self):
+        buffer = BytesIO()
+        with wave.open(buffer, "wb") as recording:
+            recording.setnchannels(1)
+            recording.setsampwidth(2)
+            recording.setframerate(16000)
+            recording.writeframes(b"\x00\x00" * 16000)
+        with patch("speech_detector.subprocess.run") as decoder:
+            evidence = _speech_evidence(buffer.getvalue())
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence["detector"], "silero")
+        self.assertEqual(evidence["durationMs"], 1000)
+        self.assertEqual(evidence["voicedMs"], 0)
+        self.assertLess(evidence["maxSpeechProbability"], evidence["speechThreshold"])
+        decoder.assert_not_called()
+
+    def test_unavailable_decoder_preserves_transcription_path(self):
+        with patch("speech_detector.shutil.which", return_value=None):
+            self.assertIsNone(_speech_evidence(b"encoded audio" * 10))
+
+    def test_noise_never_reaches_external_stt_or_agent(self):
+        create = Mock(return_value=SimpleNamespace(text="So, let's go.", segments=[
+            {"no_speech_prob": 0.0, "avg_logprob": -1.029}]))
+        provider = SimpleNamespace(name="groq", stt_model="whisper-large-v3-turbo",
+            client=SimpleNamespace(audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create))))
+        agent = SimpleNamespace(provider=provider, respond=Mock())
+        evidence = {"maxSpeechProbability": 0.155, "speechThreshold": 0.3}
+        with patch("talk_server._get_session", return_value=(agent, threading.Lock())), \
+             patch("talk_server._trace", return_value=FakeTrace()), \
+             patch("talk_server._speech_evidence", return_value=evidence), \
+             patch("talk_server._finish_response", side_effect=lambda *args, **extra: extra):
+            result = _voice_agent_reply(b"captured noise", "audio/webm", "test", "turn", False)
+        self.assertTrue(result["ignored"])
+        self.assertEqual(result["ignoreReason"], "no_speech")
+        create.assert_not_called()
+        agent.respond.assert_not_called()
+
+    def test_real_faint_no_passes_detector_and_preserves_original_stt_audio(self):
+        audio = (Path(__file__).parent / "test_audio" / "synthetic_no_16k.wav").read_bytes()
+        create = Mock(return_value=SimpleNamespace(text="No.", segments=[
+            {"no_speech_prob": 0.99, "avg_logprob": -2.0}]))
+        provider = SimpleNamespace(name="groq", stt_model="whisper-large-v3-turbo",
+            client=SimpleNamespace(audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create))))
+        agent = SimpleNamespace(provider=provider, respond=Mock(return_value=("Reply", None)))
+        with patch("talk_server._get_session", return_value=(agent, threading.Lock())), \
+             patch("talk_server._trace", return_value=FakeTrace()), \
+             patch("talk_server._last_spoken_text", return_value="Welcome to Aurora Hotel"), \
+             patch("talk_server._remember_spoken"), \
+             patch("talk_server._browser_tts_payload", return_value={}), \
+             patch("talk_server._finish_response", side_effect=lambda *args, **extra: extra):
+            result = _voice_agent_reply(audio, "audio/wav", "test", "turn", True)
+        self.assertEqual(create.call_args.kwargs["file"].getvalue(), audio)
+        agent.respond.assert_called_once_with("No.", trace=ANY)
+        self.assertNotIn("ignored", result)
+
+    def test_silence_requires_both_high_probability_and_weak_text(self):
+        self.assertTrue(_is_confident_no_speech(SimpleNamespace(segments=[
+            {"no_speech_prob": 0.95, "avg_logprob": -1.8},
+        ])))
+        self.assertFalse(_is_confident_no_speech(SimpleNamespace(segments=[
+            {"no_speech_prob": 0.95, "avg_logprob": -0.2},
+        ])))
+        self.assertFalse(_is_confident_no_speech(SimpleNamespace(segments=[
+            {"no_speech_prob": 0.1, "avg_logprob": -1.8},
+        ])))
+
+    def test_missing_metadata_and_mixed_speech_are_kept(self):
+        self.assertFalse(_is_confident_no_speech("yes"))
+        self.assertFalse(_is_confident_no_speech(SimpleNamespace(segments=[])))
+        self.assertFalse(_is_confident_no_speech(SimpleNamespace(segments=[{}])))
+        self.assertFalse(_is_confident_no_speech(SimpleNamespace(segments=[
+            SimpleNamespace(no_speech_prob=0.99, avg_logprob=-2.0),
+            SimpleNamespace(no_speech_prob=0.01, avg_logprob=-0.2),
+        ])))
+
+    def test_confident_silence_never_reaches_agent(self):
+        create = Mock(return_value=SimpleNamespace(text="Thank you.", segments=[
+            {"no_speech_prob": 0.98, "avg_logprob": -1.8},
+        ]))
+        provider = SimpleNamespace(name="groq", stt_model="whisper-large-v3-turbo",
+            client=SimpleNamespace(audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create))))
+        agent = SimpleNamespace(provider=provider, respond=Mock())
+        trace = FakeTrace()
+        with patch("talk_server._get_session", return_value=(agent, threading.Lock())), \
+             patch("talk_server._trace", return_value=trace), \
+             patch("talk_server._finish_response", side_effect=lambda *args, **extra: extra):
+            result = _voice_agent_reply(b"test audio", "audio/webm", "test", "turn", False)
+        self.assertEqual(create.call_args.kwargs["response_format"], "verbose_json")
+        agent.respond.assert_not_called()
+        self.assertTrue(result["ignored"])
+        self.assertEqual(result["ignoreReason"], "no_speech")
+
+    def test_short_real_replies_and_non_whisper_transcription_are_kept(self):
+        for model, text, expected_format in (
+            ("whisper-large-v3-turbo", "yes", "verbose_json"),
+            ("whisper-large-v3-turbo", "நன்றி", "verbose_json"),
+            ("gpt-4o-mini-transcribe", "wait", "text"),
+        ):
+            with self.subTest(model=model, text=text):
+                stt = SimpleNamespace(text=text, segments=[
+                    {"no_speech_prob": 0.8, "avg_logprob": -0.3},
+                ]) if model.startswith("whisper-") else text
+                create = Mock(return_value=stt)
+                provider = SimpleNamespace(name="groq", stt_model=model, tts_backend="system",
+                    client=SimpleNamespace(audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create))))
+                agent = SimpleNamespace(provider=provider, respond=Mock(return_value=("Reply", None)))
+                trace = FakeTrace()
+                with patch("talk_server._get_session", return_value=(agent, threading.Lock())), \
+                     patch("talk_server._trace", return_value=trace), \
+                     patch("talk_server._last_spoken_text", return_value="Welcome to Aurora Hotel"), \
+                     patch("talk_server._remember_spoken"), \
+                     patch("talk_server._system_tts_audio", return_value=None), \
+                     patch("talk_server._finish_response", side_effect=lambda *args, **extra: extra):
+                    result = _voice_agent_reply(b"test audio", "audio/webm", "test", "turn", True)
+                self.assertEqual(create.call_args.kwargs["response_format"], expected_format)
+                agent.respond.assert_called_once_with(text, trace=trace)
+                self.assertNotIn("ignored", result)
+
+
+class PlaybackCheckTests(unittest.TestCase):
+    def test_checks_filter_echo_without_running_agent_or_changing_last_reply(self):
+        spoken = "Thanks for calling Aurora Hotel reservations. Please say yes or no. We have a Standard Queen room."
+        for transcript, confirmed in (
+            ("calling Aurora Hotel reservations", False),
+            ("We have a Standard Queen room", False),
+            ("no", True),
+            ("wait", True),
+            ("Standard Queen", True),
+            ("Thanks for calling Aurora Hotel reservations. Wait, speak Tamil", True),
+        ):
+            with self.subTest(transcript=transcript):
+                create = Mock(return_value=SimpleNamespace(text=transcript, segments=[]))
+                provider = SimpleNamespace(name="groq", stt_model="whisper-large-v3-turbo",
+                    client=SimpleNamespace(audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create))))
+                agent = SimpleNamespace(provider=provider, respond=Mock())
+                trace = FakeTrace()
+                with patch("talk_server._get_session", return_value=(agent, threading.Lock())), \
+                     patch("talk_server._trace", return_value=trace), \
+                     patch("talk_server._last_spoken_text", return_value=spoken), \
+                     patch("talk_server._remember_spoken") as remember, \
+                     patch("talk_server._browser_tts_payload") as synthesize, \
+                     patch("talk_server._finish_response", side_effect=lambda *args, **extra: extra):
+                    result = _voice_agent_reply(b"preview", "audio/webm", "test", "check", True, check_only=True)
+                self.assertEqual(bool(result.get("inputConfirmed")), confirmed)
+                self.assertEqual(bool(result.get("ignored")), not confirmed)
+                agent.respond.assert_not_called()
+                remember.assert_not_called()
+                synthesize.assert_not_called()
+
+
 class PlaybackEchoTests(unittest.TestCase):
+    def test_live_partial_echo_variations_are_suppressed(self):
+        for transcript, spoken in (
+            ("Hotel reservations.", "Thanks for calling Aurora Hotel reservations. How can I help?"),
+            ("I have your check-in date.", "May I have your check‑in date, check‑out date, and the number of guests, please?"),
+            ("Check-out date and how many get", "Could you tell me your check‑out date and how many guests will be staying?"),
+            ("Could you let me know your name?", "Could you let me know your check‑out date and the total number of guests, please?"),
+            ("Time is 11 a.m.", "Our standard check‑out time is 11:00 AM."),
+            ("Sure thing. Just let...", "Sure thing—just let me know your desired check‑in date."),
+            ("I'm ready when you are.", "I’m ready when you are—just let me know your check‑in date."),
+        ):
+            with self.subTest(transcript=transcript):
+                self.assertTrue(_is_probable_playback_echo(transcript, spoken, barge_in=True))
+
     def test_greeting_fragment_is_echo(self):
         spoken = "Thanks for calling Aurora Hotel reservations. How can I help?"
         self.assertTrue(_is_probable_playback_echo("Thanks for", spoken))
