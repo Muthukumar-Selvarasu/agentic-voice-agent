@@ -60,11 +60,12 @@ let activeAgentAudio = null;
 let playbackToken = 0;
 let bargeRecordingCandidate = false;
 let pendingBargeDetectedAt = 0;
+let speakerEchoGuardUntil = 0;
 const clientEvents = [];
 
 const tuning = {
   endpointSilenceMs: Number(endpointControl?.value || 1000),
-  sensitivity: 3.2,
+  sensitivity: Number(sensitivityControl?.value || 3.6),
   minTurnMs: 400,
   speechConfirmationMs: 130,
   speechHangoverMs: 220,
@@ -102,14 +103,15 @@ function resetListeningCalibration(reason = "mode_change") {
 function applyAudioMode(mode) {
   audioMode = mode;
   if (mode === "speaker") {
-    // Tuned for laptop speaker: harder barge gate so playback echo does not self-interrupt.
-    tuning.speechConfirmationMs = 140;
-    tuning.bargeInConfirmationMs = 220;
-    tuning.bargeInArmMs = 280;
-    tuning.postPlaybackHoldMs = 700;
-    tuning.afterPlaybackEchoMs = 1800;
-    tuning.bargeEchoMultiple = 1.45;
-    tuning.playbackVolume = 0.3;
+    // Laptop speaker: barge only on a sustained spike above learned echo.
+    // Short echo bursts must not count; a real "wait" held ~300ms should.
+    tuning.speechConfirmationMs = 120;
+    tuning.bargeInConfirmationMs = 450;
+    tuning.bargeInArmMs = 800;
+    tuning.postPlaybackHoldMs = 550;
+    tuning.afterPlaybackEchoMs = 1200;
+    tuning.bargeEchoMultiple = 2.15;
+    tuning.playbackVolume = 0.2;
     if (audioModeValue) audioModeValue.textContent = "Laptop Speaker";
   } else {
     // Tuned for headset: quiet mic + no acoustic echo — keep speech pickup easy.
@@ -123,6 +125,7 @@ function applyAudioMode(mode) {
     if (audioModeValue) audioModeValue.textContent = "Headset";
   }
   resetListeningCalibration(mode);
+  speakerEchoGuardUntil = 0;
   if (activeAgentAudio) activeAgentAudio.volume = tuning.playbackVolume;
   if (muted && listenStream) {
     setListeningState("Muted", "Unmute to speak — microphone input is paused.");
@@ -248,9 +251,7 @@ function beginAgentPlayback(token, backend) {
   }
   setListeningState(
     "Agent speaking",
-    audioMode === "speaker"
-      ? "Speak now to interrupt, or click Interrupt / press Space."
-      : "Speak over Aurora to interrupt.",
+    "Speak over Aurora to interrupt.",
   );
 }
 
@@ -265,8 +266,22 @@ function finishAgentPlayback(token) {
   listenCooldownUntil = playbackEndedAt + tuning.postPlaybackHoldMs;
   bargeCandidateAt = 0;
   bargeRecordingCandidate = false;
+  if (audioMode === "speaker") {
+    // Brief guard only — long/high gates made real caller speech unreachable.
+    speakerEchoGuardUntil = playbackEndedAt + 700;
+    noiseFloor = Math.min(noiseFloor, 0.01);
+    playbackEchoFloor = Math.min(Math.max(smoothedLevel, 0.012), 0.028);
+    playbackEchoPeak = Math.min(Math.max(smoothedLevel, 0.018), 0.035);
+  } else {
+    speakerEchoGuardUntil = 0;
+  }
   if (listenStream) {
-    setListeningState("Listening", "Speak naturally. Aurora can be interrupted while talking.");
+    setListeningState(
+      "Listening",
+      audioMode === "speaker"
+        ? "Speak now. Use Interrupt/Space if you need to cut Aurora off."
+        : "Speak naturally. Aurora can be interrupted while talking.",
+    );
   }
 }
 
@@ -369,21 +384,28 @@ function thresholds() {
       start,
       end: Math.max(0.003, start * 0.4),
       barge,
+      quietFloor: start,
     };
   }
 
-  // Speaker mode:
-  // Echo floor tracks Aurora's speaker bleed. Require a clearer voice spike to barge.
-  const start = Math.min(0.09, Math.max(0.012, noiseFloor * tuning.sensitivity));
+  // Speaker mode: higher UI sensitivity = easier pickup after Aurora.
+  const ease = Math.max(1.6, 5.2 - tuning.sensitivity);
+  let start = Math.min(0.04, Math.max(0.01, noiseFloor * ease));
+  // Mild, short bump right after TTS — never lock the mic behind echo peaks.
+  if (Date.now() < speakerEchoGuardUntil) {
+    start = Math.min(0.03, Math.max(start, 0.016));
+  }
+  // Barge line sits above the echo measured during playback, with no low fixed floor.
+  // A low floor is what let speaker bleed count as the caller.
   const barge = Math.min(
-    0.085,
-    Math.max(0.03, start * 1.35, playbackEchoFloor * tuning.bargeEchoMultiple + 0.008),
+    0.2,
+    Math.max(playbackEchoPeak * 1.85 + 0.02, playbackEchoFloor * 2.6 + 0.015),
   );
   return {
     start,
-    // Keep end lower than start so quieter mid-phrase syllables still count as speech.
-    end: Math.max(0.005, start * 0.42),
+    end: Math.max(0.004, start * 0.4),
     barge,
+    quietFloor: Math.max(0.01, noiseFloor * ease * 0.9),
   };
 }
 
@@ -426,17 +448,27 @@ function startTurnRecording(isBargeIn = false) {
     recordedChunks = [];
     callerRoot.classList.remove("speaking");
     const limit = thresholds();
-    const isTooQuiet = !wasBargeIn && maxLevel < limit.start * 1.1;
+    // Use quietFloor (not the post-TTS start bump) so real speech is not discarded.
+    const quietCut = (limit.quietFloor ?? limit.start) * 1.05;
+    const isTooQuiet = !wasBargeIn && maxLevel < quietCut;
     const minBlobSize = wasBargeIn ? 300 : 500;
     if (shouldDiscard || audioBlob.size < minBlobSize || isTooQuiet) {
       currentTurnWasBargeIn = false;
+      appendRuntimeEvent(
+        shouldDiscard
+          ? "vad.turn_discarded"
+          : isTooQuiet
+            ? `vad.turn_too_quiet | level ${maxLevel.toFixed(3)} < ${quietCut.toFixed(3)}`
+            : `vad.turn_too_small | ${audioBlob.size}b`,
+      );
       if (agentSpeaking) {
-        setListeningState("Agent speaking", "Interrupt naturally by speaking over Aurora.");
+        setListeningState("Agent speaking", "Click Interrupt or press Space to cut in.");
       } else if (listenStream) {
-        setListeningState("Listening", "Speak naturally. Aurora can be interrupted while talking.");
+        setListeningState("Listening", "Speak a bit louder, then pause when finished.");
       }
       return;
     }
+    speakerEchoGuardUntil = 0;
     sendAudioToAgent(audioBlob);
   };
   recorder.start(100);
@@ -587,25 +619,35 @@ function vadLoop() {
   if (agentSpeaking && !muted) {
     const playbackAge = now - playbackStartedAt;
     if (audioMode === "speaker") {
-      // Learn steady speaker echo; do not let peaks raise the barge gate.
-      if (!bargeCandidateAt && smoothedLevel < limit.barge * 0.9) {
-        playbackEchoFloor = (playbackEchoFloor * 0.88) + (smoothedLevel * 0.12);
-        playbackEchoPeak = Math.max(playbackEchoPeak * 0.94, smoothedLevel);
-      } else {
-        playbackEchoPeak *= 0.98;
+      // First part of playback only measures how loud Aurora is in the mic.
+      if (playbackAge < tuning.bargeInArmMs) {
+        playbackEchoPeak = Math.max(playbackEchoPeak * 0.96, Math.min(smoothedLevel, 0.16));
+        playbackEchoFloor = (playbackEchoFloor * 0.85) + (Math.min(smoothedLevel, playbackEchoPeak) * 0.15);
+        bargeCandidateAt = 0;
+        lastBargeHitAt = 0;
+        bargeRecordingCandidate = false;
+      } else if (smoothedLevel < playbackEchoPeak * 1.45) {
+        // Still her voice. Keep the gate on the live echo so it cannot sit below playback.
+        playbackEchoPeak = Math.max(playbackEchoPeak * 0.97, Math.min(smoothedLevel, 0.16));
+        playbackEchoFloor = (playbackEchoFloor * 0.9) + (Math.min(smoothedLevel, playbackEchoPeak) * 0.1);
+        if (bargeRecordingCandidate && now - lastBargeHitAt >= 80) {
+          bargeRecordingCandidate = false;
+          bargeCandidateAt = 0;
+          appendRuntimeEvent("barge_in.candidate_dropped");
+          restoreAgentPlaybackVolume();
+        }
       }
     } else if (!bargeCandidateAt && smoothedLevel < limit.barge * 0.9) {
       playbackEchoFloor = (playbackEchoFloor * 0.9) + (smoothedLevel * 0.1);
       playbackEchoPeak = Math.max(playbackEchoPeak * 0.96, smoothedLevel);
-    } else {
+    } else if (audioMode !== "speaker") {
       playbackEchoPeak *= 0.98;
     }
     const liveLimit = thresholds();
-    // In speaker mode, require a clear voice spike above the learned echo floor.
-    const relativeSpike = smoothedLevel > (playbackEchoFloor * 1.38 + 0.008);
-    const bargeHit = smoothedLevel > liveLimit.barge || (audioMode === "speaker" && relativeSpike);
+    const speakerReady = audioMode !== "speaker" || playbackAge >= tuning.bargeInArmMs;
+    const bargeHit = speakerReady && smoothedLevel > liveLimit.barge;
 
-    if (playbackAge < tuning.bargeInArmMs) {
+    if (!speakerReady) {
       bargeCandidateAt = 0;
       lastBargeHitAt = 0;
       bargeRecordingCandidate = false;
@@ -627,8 +669,9 @@ function vadLoop() {
         lastSpeechAt = now;
       }
     } else {
-      // Hangover window: keep candidate alive across brief phoneme dips (~140ms)
-      const hangoverActive = bargeCandidateAt && (now - lastBargeHitAt < 140);
+      // Speaker echo dips often; a short hangover keeps a real interrupt alive.
+      const hangoverMs = audioMode === "speaker" ? 90 : 140;
+      const hangoverActive = bargeCandidateAt && (now - lastBargeHitAt < hangoverMs);
       if (!hangoverActive) {
         if (bargeRecordingCandidate) {
           bargeRecordingCandidate = false;
@@ -646,7 +689,8 @@ function vadLoop() {
         listenCooldownUntil = 0;
         speechCandidateAt = speechCandidateAt || now;
       } else if (smoothedLevel < limit.start * 1.5) {
-        const sample = Math.min(rawLevel, audioMode === "headset" ? 0.02 : 0.016);
+        // Speaker: never break the post-TTS hold with residual echo — wait it out.
+        const sample = Math.min(rawLevel, audioMode === "headset" ? 0.02 : 0.014);
         noiseFloor = (noiseFloor * 0.95) + (sample * 0.05);
       }
     } else if (!recorder) {
@@ -814,7 +858,7 @@ endpointControl.addEventListener("input", () => {
 sensitivityControl.addEventListener("input", () => {
   tuning.sensitivity = Number(sensitivityControl.value);
   sensitivityValue.textContent = `${tuning.sensitivity.toFixed(1)}x`;
-  if (audioMode === "headset") resetListeningCalibration("sensitivity");
+  resetListeningCalibration("sensitivity");
 });
 
 audioModeControl?.addEventListener("change", () => {
