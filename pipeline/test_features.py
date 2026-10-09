@@ -79,6 +79,10 @@ class RouterTests(unittest.TestCase):
 
     def test_courtesy_phrases_are_detected(self):
         self.assertTrue(is_courtesy_only("நன்றி"))
+        self.assertTrue(is_courtesy_only("ரொம்ப நன்றி"))
+        self.assertTrue(is_courtesy_only("மிக்க நன்றி"))
+        self.assertTrue(is_courtesy_only("Okay romba nandri"))
+        self.assertTrue(is_courtesy_only("Ok thanks"))
         self.assertTrue(is_courtesy_only("¡Gracias!"))
         self.assertTrue(is_courtesy_only("Thank you"))
         self.assertFalse(is_courtesy_only("Goodbye"))

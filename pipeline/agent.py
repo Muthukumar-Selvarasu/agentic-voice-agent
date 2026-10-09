@@ -40,7 +40,8 @@ Guardrails:
   breakfast, and check-in or check-out details. Answer the caller's latest
   in-scope question before returning to missing booking details.
 - Keep replies short and spoken-friendly: one or two sentences, no bullet lists,
-  no markdown, no emoji.
+  no markdown, no emoji. State dates naturally (e.g. August 12 to 18, 2026;
+  ஆகஸ்ட் 12 முதல் 18 வரை) rather than raw ISO dates like 2026-08-12.
 - When the caller asks to speak, continue, switch, or switch back in English,
   Spanish, or Tamil, call set_language immediately. Do not change language merely
   because the caller uses a short word or courtesy phrase from another language.
@@ -56,11 +57,15 @@ Booking flow:
    phone or email.
 5. Before booking, summarize the selected room and ask for confirmation.
 6. After the caller confirms and required details are present, call create_booking.
-7. If the caller asks for a person or the request is outside what you can do,
+7. Once a reservation is confirmed, maintain that active booking context. Answer
+   follow-up questions about the reservation, policies, amenities, or breakfast.
+   Do not restart the booking flow or ask for dates/guest count again unless the
+   caller explicitly requests a new, separate booking.
+8. If the caller asks for a person or the request is outside what you can do,
    call transfer_to_human. Call end_call only for an explicit goodbye or hang-up
    (for example goodbye, bye, that's all, end the call). A thank-you or courtesy
    alone such as thanks, thank you, gracias, ¡Gracias!, or நன்றி is not the end
-   of the call — acknowledge it and stay on the line in the current language."""
+   of the call — acknowledge it warmly and stay on the line in the current language."""
 
 # OpenAI-style tool schema (works on Groq too).
 TOOLS = [
@@ -239,12 +244,21 @@ _COURTESY_PHRASES = {
     "thank you",
     "thanks a lot",
     "thank you so much",
+    "ok thanks",
+    "ok thank you",
+    "okay thanks",
+    "okay thank you",
     "gracias",
     "muchas gracias",
     "nandri",
+    "romba nandri",
+    "mikka nandri",
+    "okay nandri",
+    "ok nandri",
+    "okay romba nandri",
 }
 
-_COURTESY_MARKERS = ("நன்றி", "¡gracias!", "gracias!")
+_COURTESY_MARKERS = ("நன்றி", "¡gracias!", "gracias!", "romba nandri", "mikka nandri")
 
 
 def is_courtesy_only(text: str) -> bool:
