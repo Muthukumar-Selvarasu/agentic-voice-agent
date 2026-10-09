@@ -14,3 +14,4 @@ private/
 logs/
 logs/*.jsonl
 graphify-out/
+local-tracking
