@@ -112,12 +112,6 @@ h2 {
   color: var(--blue);
 }
 
-.listening-state[data-state="interrupted"],
-.listening-state[data-state="muted"] {
-  border-color: #e0b4b4;
-  background: #fbf1f1;
-  color: var(--red);
-}
 
 .stage {
   display: grid;
@@ -248,11 +242,6 @@ button.secondary {
   color: #354052;
 }
 
-button.interrupt.interrupt-ready:not(:disabled) {
-  border-color: #c45c16;
-  background: #c45c16;
-  color: #ffffff;
-}
 
 button.danger {
   border-color: #d3b2b2;

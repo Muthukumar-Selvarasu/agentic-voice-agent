@@ -16,8 +16,11 @@ from unittest.mock import ANY, Mock, patch
 from talk_server import (
     _browser_tts_payload,
     _system_tts_audio,
+    _is_correlated_residual_echo,
     _is_probable_playback_echo,
+    _is_correlated_numeric_echo,
     _is_confident_no_speech,
+    _is_weak_truncated_playback_echo,
     _speech_evidence,
     _speech_activity_reply,
     _voice_agent_reply,
@@ -347,7 +350,120 @@ class PlaybackCheckTests(unittest.TestCase):
                 synthesize.assert_not_called()
 
 
+class GenerationAdmissionTests(unittest.TestCase):
+    def test_ignored_echo_does_not_supersede_a_pending_typed_reply(self):
+        create = Mock(return_value=SimpleNamespace(text="So I'm just going to be calling.", segments=[]))
+        provider = SimpleNamespace(name="groq", stt_model="whisper-large-v3-turbo",
+            client=SimpleNamespace(audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create))))
+        agent = SimpleNamespace(provider=provider, respond=Mock())
+        with patch("talk_server._get_session", return_value=(agent, threading.Lock())), \
+             patch("talk_server._trace", return_value=FakeTrace()), \
+             patch("talk_server._speech_evidence", return_value={
+                 "maxSpeechProbability": .99, "speechThreshold": .3,
+             }), \
+             patch("talk_server._last_spoken_text", return_value="Thanks for calling Aurora Hotel reservations."), \
+             patch("talk_server._is_probable_playback_echo", return_value=True), \
+             patch("talk_server._admit_generation") as admit, \
+             patch("talk_server._finish_response", side_effect=lambda *args, **extra: extra):
+            result = _voice_agent_reply(b"echo clip", "audio/wav", "test", "echo", True,
+                                        generation=8)
+        self.assertTrue(result["ignored"])
+        self.assertEqual(result["ignoreReason"], "probable_playback_echo")
+        admit.assert_not_called()
+        agent.respond.assert_not_called()
+
+    def test_confirmed_caller_input_admits_its_generation(self):
+        create = Mock(return_value=SimpleNamespace(text="No.", segments=[]))
+        provider = SimpleNamespace(name="groq", stt_model="whisper-large-v3-turbo",
+            client=SimpleNamespace(audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create))))
+        agent = SimpleNamespace(provider=provider, respond=Mock(return_value=("Okay.", None)))
+        with patch("talk_server._get_session", return_value=(agent, threading.Lock())), \
+             patch("talk_server._trace", return_value=FakeTrace()), \
+             patch("talk_server._speech_evidence", return_value=None), \
+             patch("talk_server._last_spoken_text", return_value="Thanks for calling."), \
+             patch("talk_server._is_probable_playback_echo", return_value=False), \
+             patch("talk_server._admit_generation") as admit, \
+             patch("talk_server._remember_spoken"), \
+             patch("talk_server._browser_tts_payload", return_value={}), \
+             patch("talk_server._remember_audio"), \
+             patch("talk_server._finish_response", side_effect=lambda *args, **extra: extra):
+            _voice_agent_reply(b"caller speech", "audio/wav", "test", "caller", True,
+                               generation=9)
+        admit.assert_called_once_with("test", 9)
+
+
+class TruncatedPlaybackEchoTests(unittest.TestCase):
+    def setUp(self):
+        self.evidence = {
+            "correlation": .8541, "residualEnergyFraction": .450843,
+            "residualGain": 1.709, "matchedMs": 289.0,
+            "truncatedPlayback": True,
+        }
+        self.speech = {"voicedFraction": .2514}
+
+    def test_weak_short_residual_stt_does_not_become_a_caller_turn(self):
+        stt = SimpleNamespace(segments=[{"no_speech_prob": 0.0, "avg_logprob": -1.415}])
+        self.assertTrue(_is_weak_truncated_playback_echo(self.evidence, self.speech, stt))
+
+    def test_confident_caller_speech_and_untruncated_audio_are_preserved(self):
+        confident = SimpleNamespace(segments=[{"no_speech_prob": 0.0, "avg_logprob": -0.3}])
+        self.assertFalse(_is_weak_truncated_playback_echo(self.evidence, self.speech, confident))
+        weak = SimpleNamespace(segments=[{"no_speech_prob": 0.0, "avg_logprob": -1.5}])
+        self.assertFalse(_is_weak_truncated_playback_echo(
+            self.evidence, {"voicedFraction": .42}, weak,
+        ))
+        self.assertFalse(_is_weak_truncated_playback_echo(
+            {**self.evidence, "truncatedPlayback": False}, self.speech, weak,
+        ))
+
+
 class PlaybackEchoTests(unittest.TestCase):
+    def test_numeric_price_echo_with_short_lead_in_is_rejected(self):
+        spoken = "We have a Standard Queen for $189 per night, and a Deluxe King for $229."
+        evidence = {"correlation": .8832, "residualEnergyFraction": .22,
+                    "residualGain": 1.086}
+        self.assertTrue(_is_correlated_numeric_echo("For 189.", spoken, evidence))
+        self.assertTrue(_is_correlated_numeric_echo("For $200.", spoken, evidence))
+        self.assertTrue(_is_correlated_numeric_echo("$9.", spoken, evidence))
+        self.assertFalse(_is_correlated_numeric_echo("No, $200.", spoken, evidence))
+        self.assertFalse(_is_correlated_numeric_echo("Deluxe King for $200", spoken, evidence))
+
+    def test_quiet_correlated_residual_echo_fragments_are_rejected(self):
+        spoken = "We have a Deluxe King for $229 per night."
+        evidence = {"correlation": .9938, "residualEnergyFraction": .01233,
+                    "residualGain": 4.0}
+        residual_speech = {"voicedFraction": .75}
+        self.assertTrue(_is_correlated_residual_echo("A delight.", spoken,
+                                                     evidence, residual_speech))
+        self.assertTrue(_is_correlated_residual_echo("For $200.", spoken,
+                                                     evidence, residual_speech))
+        self.assertTrue(_is_correlated_residual_echo("$9.", spoken,
+                                                     evidence, {"voicedFraction": .87}))
+        self.assertTrue(_is_correlated_residual_echo(
+            "Aurora Hotel", spoken,
+            {"correlation": .9972, "residualEnergyFraction": .005493, "residualGain": 4.0},
+            {"voicedFraction": .96},
+        ))
+        self.assertTrue(_is_correlated_residual_echo(
+            "I'm sorry, I can only help with the right.",
+            "I'm sorry, I can only help with Aurora Hotel reservations. Would you like to book?",
+            evidence, {"voicedFraction": .77},
+        ))
+
+    def test_distinct_short_caller_answers_and_explicit_corrections_survive(self):
+        spoken = "We have a Deluxe King for $229 per night."
+        evidence = {"correlation": .9958, "residualEnergyFraction": .008302,
+                    "residualGain": 4.0}
+        self.assertFalse(_is_correlated_residual_echo(
+            "No.", spoken, evidence, {"voicedFraction": .498}))
+        self.assertFalse(_is_correlated_residual_echo(
+            "No, for $200.", spoken, evidence, {"voicedFraction": .675}))
+        self.assertFalse(_is_correlated_residual_echo(
+            "Deluxe King", spoken, evidence, {"voicedFraction": .87}))
+        self.assertFalse(_is_correlated_residual_echo(
+            "For $200.", spoken, {**evidence, "residualEnergyFraction": .07},
+            {"voicedFraction": .675}))
+
     def test_live_partial_echo_variations_are_suppressed(self):
         for transcript, spoken in (
             ("Hotel reservations.", "Thanks for calling Aurora Hotel reservations. How can I help?"),
@@ -402,6 +518,19 @@ class PlaybackEchoTests(unittest.TestCase):
         spoken = "We have a Standard Queen for $189 per night and a Deluxe King for $229. Which would you like?"
         self.assertTrue(_is_probable_playback_echo("Standard Queen night", spoken))
         self.assertTrue(_is_probable_playback_echo("Deluxe King which would you like", spoken))
+
+    def test_correlated_stt_near_match_is_filtered_but_short_answers_survive(self):
+        spoken = "We have a Standard Queen for $189 per night and a Deluxe King for $229."
+        evidence = {'correlation': .9671, 'residualEnergyFraction': .064738,
+                    'residualGain': 2.892}
+        self.assertFalse(_is_probable_playback_echo(
+            "We have a stand-up.", spoken, barge_in=True))
+        self.assertTrue(_is_probable_playback_echo(
+            "We have a stand-up.", spoken, barge_in=True, echo_evidence=evidence))
+        self.assertFalse(_is_probable_playback_echo(
+            "Standard Queen", spoken, barge_in=True, echo_evidence=evidence))
+        self.assertFalse(_is_probable_playback_echo(
+            "What about cancellation?", spoken, barge_in=True, echo_evidence=evidence))
 
     def test_tamil_real_interruption_is_kept(self):
         spoken = "அரோரா ஹோட்டல் முன்பதிவில் உதவ முடியும்."

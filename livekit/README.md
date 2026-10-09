@@ -103,9 +103,9 @@ Put `LIVEKIT_URL` (`wss`), `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_ROO
 |---------|-------|
 | Could not establish PC connection | Confirm `./start_local_server.sh` is still running on port 7880 |
 | UI loads but Start call fails | Confirm both the LiveKit server and `talk_server.py` are running |
-| No microphone activity | Allow browser microphone access and check the Caller Demo mute state |
+| No microphone activity | Allow browser microphone access, then restart the call |
 | Background noise starts turns | Increase Speech sensitivity |
-| Aurora interrupts itself | Reload the latest UI, use headphones if available, and increase Speech sensitivity |
+| Aurora interrupts itself | Reload the latest UI and inspect local speech evidence and playback-check diagnostics |
 | Turns commit too quickly | Increase Endpoint silence |
 | Turns feel slow | Decrease Endpoint silence carefully |
 | No real transcription in mock mode | Set a live provider in `pipeline/.env` |
@@ -127,13 +127,14 @@ reported `echoCancellation` setting and current playback state.
 Echo checks use the same STT model while output continues; a rejected echo
 candidate must produce no audible pause or agent reply. A real interruption
 should produce `barge_in.speech_confirmed` (including onset-to-pause milliseconds)
-and a caller transcript. Capture starts on the first raw microphone hit and
-continues during the check. Preview windows normally take 900 ms, or at least
+and a caller transcript. AudioWorklet capture keeps 300 ms of PCM pre-roll and starts a complete WAV recording
+on the first raw microphone hit. MediaRecorder remains a fallback when AudioWorklet
+is unavailable. Capture continues during the check and while a reply is processing. Preview windows normally take 900 ms, or at least
 400 ms for a brief utterance followed by silence, plus the STT round trip.
 The listener clock also checks this deadline: some encoders stop delivering
 timeslice chunks during silence, so chunk callbacks alone can strand a brief
-"no" candidate indefinitely. Muting discards open caller recordings instead
-of joining speech from before and after the mute.
+"no" candidate indefinitely. End call discards open caller recordings and invalidates
+pending activity, STT, typed-message, and greeting responses.
 Measure the resulting latency on the actual device before calling it natural
 talk-over. `barge_in.pause_acknowledged | false` means the browser failed to
 pause native synthesis; the candidate is discarded without claiming an
@@ -210,10 +211,10 @@ Late preview confirmation does not restart that wait. Ordinary capture starts
 on the first microphone hit, and an early rejected preview can retry the same
 recording twice to retain a short caller's first word. Final transcription still
 covers the complete recording because the caller may continue after the preview.
-Short callers
-repeating a room choice or saying "no"/"wait" remain eligible, but verbatim
-long repetitions of the currently playing reply are acoustically ambiguous
-with speaker echo and still need hardware verification.
+Short callers repeating a room choice or saying "no"/"wait" remain eligible.
+When a rendered playback reference is available, correlated echo is removed
+before checking residual caller speech. Hardware verification remains necessary
+for reverberant rooms and device processing that substantially alters playback.
 
 A human retest exposed recordings lasting 6.84–24.96 seconds despite only
 1.15–1.92 seconds of detected speech in representative clips. That was an
@@ -246,3 +247,86 @@ Offline regressions: `node --test livekit/test_talk_browser.cjs` and
 `livekit/.venv/bin/python -m unittest discover -s livekit -p 'test_*.py'` from
 the repository root, after installing the requirements. The acoustic tests use
 bundled synthetic WAVs and run locally without sound output or external STT.
+
+## Automatic conversation and message controls
+
+The default audio mode is Automatic for both speakers and headphones. It does
+not identify or switch the OS output device. It uses a bounded, calibrated energy
+trigger (0.003–0.012 RMS) only to open capture; local neural speech evidence and
+STT confirm input before output pauses. Noise can open a speculative recording,
+but rejected input produces no pause or agent turn. Device changes reset learned
+noise at a safe turn boundary. Speaker/headset presets and the silence/sensitivity
+controls remain optional overrides pending the separate user decision about the
+caller-facing Turn tuning section; the internal defaults remain available either way.
+The default Automatic endpoint is 1,000 ms after detected speech, including longer
+answers. Manual speaker/headset presets can add up to 550 ms for longer answers.
+Increasing the configured wait preserves longer pauses at the cost of response
+delay. Language does not require a separate preset.
+
+Caller speech is captured during processing. A ready response is held while a
+candidate is checked: rejected noise releases it; confirmed speech supersedes it.
+Preview transcription runs outside the reasoning lock. Request generations fence
+late responses before rendering/delivery, and new calls use fresh session IDs.
+Prepared replies that never played are removed from model history. Interrupted
+replies carry the playback position and an approximate already-spoken prefix, so
+the agent can avoid repeating it without assuming the caller heard or agreed to
+the unplayed remainder. Completed tool results remain in history:
+superseding a reply does not undo an already executed booking or other tool action.
+
+Start call and End call are the only call controls. End stops playback, microphone
+tracks, the PCM ring, outstanding requests, and the listener. The message form is
+labeled “Message the agent” and explicitly supports English, Spanish, and Tamil.
+Its text travels unchanged to the existing hotel agent and language router.
+
+Generated microphone validation on Chrome 155/macOS, default Automatic mode,
+Groq Whisper and the existing reasoning model/system WAV output retained complete
+“Wait, speak Tamil”, “No”, and “Yes” transcripts. Mid-response Wait paused output
+in 1.18 s; a correction at 0.1 voice amplitude during processing confirmed in
+0.84 s and prevented the earlier reply from playing; No injected 80 ms after
+playback began paused it in 1.00 s; Yes at 0.1 amplitude paused it in 0.86 s.
+A working target is confirmation within 1.5 s on this setup, including the STT
+round trip; provider latency can exceed that, and no hard real-time guarantee is
+made. These are generated microphone checks, not new physical headset/device
+acceptance. The earlier accepted physical retest belongs to FDE-243. Native
+synthesis that cannot acknowledge pause remains a guarded unsupported interruption
+path; system/provider WAV output is the validated controllable path.
+
+
+### Playback reference verification
+
+Each recording carries the actual playing reply's ID and playback position,
+including the retained PCM pre-roll. The server keeps two rendered references
+per session, bounded to eight sessions, and clears them on reset. It searches
+within 500 ms of the reported position and subtracts a scaled reference only
+when correlation is at least 0.72. A local neural check rejects a speech-free
+residual before external transcription. A residual containing speech is sent to
+STT as a complete WAV; its level correction is capped at four times and disabled
+below the PCM quantization floor. Missing references, unavailable decoding, or
+uncorrelated audio retain the existing speech and text checks. Browser-native
+speech has no rendered reference and uses that fallback path.
+
+A stronger generated browser echo-return check exposed a false interruption
+before this reference repair: Whisper altered an echo fragment enough to defeat
+the text comparison. The repair now passes offline reference-routing tests and
+nine silent checks using freshly rendered system speech: echo-only return at
+0.03 and 0.25 amplitude was rejected at onset, mid-response and near the end;
+quiet “No” mixed with 0.25 playback remained speech in all three positions.
+These WAVs were rendered into memory/files without playback or external STT.
+The browser rerun and physical speaker/headphone verification are pending;
+no browser or audible testing was performed during the user's meeting.
+
+### Current repair checkpoint
+
+The original checkout passes 88 Python tests and 47 browser-harness tests. These
+are regression checks, not acceptance of natural turn-taking. Later generated
+browser checks reproduced intermittent playback echo accepted as caller speech,
+including altered room prices. The latest saved synthetic echo clip still left
+26.6% residual energy and was classified as voiced, so the echo repair remains
+open. Quiet short answers must remain eligible even below 2% residual energy;
+raising that cutoff can hide echo failures by discarding genuine caller speech.
+
+Physical microphone/speaker acceptance and end-to-end validation of repeated
+reply endings remain pending. The recording-review checklist also covers honest
+interruption labels, cancelled-turn state, ambiguous-room clarification, answer
+provenance, distinct booking references, Tamil transcription and unsent drafts.
+Committing this checkpoint does not mark those tasks complete.

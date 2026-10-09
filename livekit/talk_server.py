@@ -9,6 +9,7 @@ import base64
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,6 +37,9 @@ _session_registry_lock = threading.Lock()
 _agent_sessions: dict[str, object] = {}
 _session_locks: dict[str, threading.Lock] = {}
 _last_spoken: dict[str, str] = {}
+_request_generations: dict[str, int] = {}
+_response_deliveries: dict[str, dict[str, dict]] = {}
+_playback_references: dict[str, dict[str, bytes]] = {}
 
 GREETING = "Thanks for calling Aurora Hotel reservations. How can I help?"
 
@@ -137,11 +141,179 @@ def _reset_session(session_id: str) -> None:
         _agent_sessions.pop(session_id, None)
         _session_locks.pop(session_id, None)
         _last_spoken.pop(session_id, None)
+        _request_generations.pop(session_id, None)
+        _response_deliveries.pop(session_id, None)
+        _playback_references.pop(session_id, None)
+
+
+def _admit_generation(session_id: str, generation: int | None) -> None:
+    if generation is not None:
+        with _session_registry_lock:
+            _request_generations[session_id] = max(generation, _request_generations.get(session_id, 0))
+            for record in _response_deliveries.get(session_id, {}).values():
+                if record.get("generation") is not None and record["generation"] < generation and record.get("state") is None:
+                    # Conservative fallback if the browser's delivery feedback
+                    # was lost: an older prepared reply is never assumed heard.
+                    record["state"] = "discarded"
+
+
+def _superseded(session_id: str, generation: int | None) -> bool:
+    with _session_registry_lock:
+        return generation is not None and generation < _request_generations.get(session_id, 0)
+
+
+def _playback_feedback(
+    session_id: str,
+    turn_id: str,
+    state: str,
+    generation: int | None = None,
+    heard_through_ms: float | None = None,
+    playback_duration_ms: float | None = None,
+) -> dict:
+    if state not in {"completed", "interrupted", "discarded"}:
+        raise ValueError("Invalid playback state")
+    for value in (heard_through_ms, playback_duration_ms):
+        if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value < 0 or value > 3600000):
+            raise ValueError("Invalid playback position")
+    if (heard_through_ms is None) != (playback_duration_ms is None):
+        raise ValueError("Incomplete playback position")
+    _admit_generation(session_id, generation)
+    with _session_registry_lock:
+        record = _response_deliveries.setdefault(session_id, {}).setdefault(turn_id, {})
+        # Out-of-order interruption must not overwrite a completed delivery.
+        if record.get("state") != "completed":
+            record["state"] = state
+            if state in {"interrupted", "completed"} and playback_duration_ms:
+                record["heard_through_ms"] = min(heard_through_ms, playback_duration_ms)
+                record["playback_duration_ms"] = playback_duration_ms
+    return {"acknowledged": True}
+
+
+def _register_delivery(agent, session_id: str, turn_id: str | None, reply: str, generation: int | None = None) -> None:
+    if turn_id is None:
+        return
+    messages = getattr(agent, "messages", [])
+    message = messages[-1] if isinstance(messages, list) and messages else None
+    if not isinstance(message, dict) or message.get("role") != "assistant" or message.get("content") != reply:
+        message = None
+    with _session_registry_lock:
+        records = _response_deliveries.setdefault(session_id, {})
+        record = records.setdefault(turn_id, {})
+        record.update(message=message, original=reply, generation=generation)
+        # Keep only recent delivery metadata; conversation messages remain intact.
+        while len(records) > 32:
+            records.pop(next(iter(records)))
+
+
+def _interrupted_playback_note(record: dict) -> str:
+    heard_ms = record.get("heard_through_ms")
+    duration_ms = record.get("playback_duration_ms")
+    original = record.get("original", "")
+    if not isinstance(heard_ms, (int, float)) or not isinstance(duration_ms, (int, float)) or duration_ms <= 0 or not original:
+        return ("[Playback note: Aurora's voice reply was interrupted. "
+                "Do not assume the caller heard the full reply or agreed to anything in it.]")
+
+    fraction = min(1.0, max(0.0, heard_ms / duration_ms))
+    prefix_end = round(len(original) * fraction)
+    if prefix_end < len(original):
+        word_end = original.rfind(" ", 0, prefix_end + 1)
+        if word_end > 0:
+            prefix_end = word_end
+    heard = original[:prefix_end].strip()
+    if len(heard) > 1200:
+        heard = heard[:heard.rfind(" ", 0, 1200)].rstrip()
+    if not heard:
+        return ("[Playback note: Aurora's voice reply was interrupted near the start. "
+                "Do not assume the caller heard the full reply or agreed to anything in it.]")
+    return (f"[Playback note: Aurora's voice reply was interrupted at about {fraction:.0%} of its audio. "
+            f"Approximate portion already spoken: {heard!r}. The caller may not have heard the rest. "
+            "Do not repeat the approximate portion unless asked, and do not assume the caller heard or agreed to the remainder.]")
+
+
+def _apply_delivery_feedback(agent, session_id: str) -> None:
+    messages = getattr(agent, "messages", None)
+    if not isinstance(messages, list):
+        return
+    with _session_registry_lock:
+        records = list(_response_deliveries.get(session_id, {}).values())
+        for record in records:
+            message = record.get("message")
+            if message is None:
+                continue
+            index = next((i for i, item in enumerate(messages) if item is message), None)
+            if index is None:
+                continue
+            state = record.get("state")
+            if state == "discarded":
+                messages.pop(index)
+            elif state == "interrupted":
+                message["content"] = _interrupted_playback_note(record)
+            elif state == "completed":
+                message["content"] = record["original"]
+
+
+def _discard_superseded(agent, trace, session_id, turn_id, generation) -> dict | None:
+    if not _superseded(session_id, generation):
+        return None
+    if turn_id is not None:
+        _playback_feedback(session_id, turn_id, "discarded")
+    _apply_delivery_feedback(agent, session_id)
+    trace.event("response.superseded")
+    return _finish_response(agent, trace, "", None, ignored=True,
+                            ignoreReason="superseded", response_sources=[])
 
 
 def _remember_spoken(session_id: str, text: str) -> None:
     with _session_registry_lock:
         _last_spoken[session_id] = text
+
+
+def _remember_audio(session_id: str, turn_id: str | None, tts: dict) -> None:
+    encoded = tts.get("audioBase64")
+    if not turn_id or not encoded or len(encoded) > 12 * 1024 * 1024:
+        return
+    try:
+        audio = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError):
+        return
+    with _session_registry_lock:
+        references = _playback_references.setdefault(session_id, {})
+        references[turn_id] = audio
+        while len(references) > 2:
+            references.pop(next(iter(references)))
+        while len(_playback_references) > 8:
+            _playback_references.pop(next(iter(_playback_references)))
+
+
+def _playback_residual(
+    audio: bytes,
+    session_id: str,
+    reference_id: str | None,
+    offset_ms: float | None,
+    playback_through_ms: float | None = None,
+):
+    if not reference_id:
+        return None
+    with _session_registry_lock:
+        reference = _playback_references.get(session_id, {}).get(reference_id)
+    if not reference:
+        return None
+    with _session_registry_lock:
+        delivery = _response_deliveries.get(session_id, {}).get(reference_id, {})
+        playback_end_ms = playback_through_ms
+        if playback_end_ms is None and delivery.get("state") in {"interrupted", "completed"}:
+            playback_end_ms = delivery.get("heard_through_ms")
+    try:
+        from echo_detector import residual_audio
+        result = residual_audio(audio, reference, offset_ms, playback_end_ms)
+        if result is None and offset_ms is not None:
+            result = residual_audio(audio, reference, None)
+            if result is not None:
+                result[1]["offsetSearchFallback"] = True
+        return result
+    except Exception:
+        # Missing optional local dependencies keep the existing speech/text path.
+        return None
 
 
 def _last_spoken_text(session_id: str) -> str:
@@ -251,25 +423,40 @@ def _greeting_reply(session_id: str) -> dict:
     with lock:
         tts = _browser_tts_payload(agent, trace, GREETING)
     _remember_spoken(session_id, GREETING)
+    _remember_audio(session_id, "greeting", tts)
     return _finish_response(
         agent,
         trace,
         GREETING,
         None,
+        responseTurnId="greeting",
         response_sources=[],
         **tts,
     )
 
 
-def _agent_reply(text: str, session_id: str, turn_id: str | None) -> dict:
+def _agent_reply(text: str, session_id: str, turn_id: str | None, generation: int | None = None) -> dict:
+    _admit_generation(session_id, generation)
     agent, lock = _get_session(session_id)
     trace = _trace(session_id, turn_id)
     trace.event("input.text")
     with lock:
+        _apply_delivery_feedback(agent, session_id)
+        stale = _discard_superseded(agent, trace, session_id, turn_id, generation)
+        if stale is not None:
+            return stale
         reply, action = agent.respond(text, trace=trace)
+        _register_delivery(agent, session_id, turn_id, reply, generation)
+        stale = _discard_superseded(agent, trace, session_id, turn_id, generation)
+        if stale is not None:
+            return stale
         tts = _browser_tts_payload(agent, trace, reply)
-    _remember_spoken(session_id, reply)
-    return _finish_response(agent, trace, reply, action, **tts)
+        stale = _discard_superseded(agent, trace, session_id, turn_id, generation)
+        if stale is not None:
+            return stale
+        _remember_spoken(session_id, reply)
+        _remember_audio(session_id, turn_id, tts)
+        return _finish_response(agent, trace, reply, action, responseTurnId=turn_id, **tts)
 
 
 def _speech_evidence(audio: bytes) -> dict | None:
@@ -328,6 +515,10 @@ def _voice_agent_reply(
     after_playback: bool = False,
     check_only: bool = False,
     client_timings: dict | None = None,
+    generation: int | None = None,
+    reference_id: str | None = None,
+    playback_offset_ms: float | None = None,
+    playback_through_ms: float | None = None,
 ) -> dict:
     agent, lock = _get_session(session_id)
     trace = _trace(session_id, turn_id)
@@ -335,106 +526,188 @@ def _voice_agent_reply(
     if client_timings:
         trace.event("client.timing", **client_timings)
     no_speech = False
+    stt = None
     speech_evidence = None
-    with lock:
-        if getattr(agent.provider, "name", "") == "mock":
-            with trace.span("stt", model=getattr(agent.provider, "stt_model", "unknown")):
-                transcript = agent.provider.transcribe(b"")
-        else:
+    echo_evidence = None
+    if getattr(agent.provider, "name", "") == "mock":
+        with trace.span("stt", model=getattr(agent.provider, "stt_model", "unknown")):
+            transcript = agent.provider.transcribe(b"")
+    else:
+        with _session_registry_lock:
+            reference_available = bool(
+                reference_id and _playback_references.get(session_id, {}).get(reference_id)
+            )
+        trace.event("playback.reference", provided=bool(reference_id),
+                    available=reference_available, offsetProvided=playback_offset_ms is not None,
+                    offsetMs=round(playback_offset_ms, 1) if playback_offset_ms is not None else None,
+                    throughProvided=playback_through_ms is not None,
+                    throughMs=round(playback_through_ms, 1) if playback_through_ms is not None else None)
+        with trace.span("echo"):
+            residual = _playback_residual(
+                audio, session_id, reference_id, playback_offset_ms, playback_through_ms,
+            )
+        if residual is None and reference_id and reference_available:
+            trace.event("playback.reference_unmatched")
+        if residual is not None:
+            clean_audio, echo_evidence = residual
+            if echo_evidence.get("residualEnergyFraction", 1.0) <= 0.0001:
+                # Only a practically empty residue can bypass speech detection.
+                # Quiet caller speech beneath playback can have less than 2%
+                # of its energy and still contain a clearly detectable answer.
+                trace.event("playback.echo_suppressed", reason="low_residual_energy", **echo_evidence)
+                return _finish_response(agent, trace, "", None, transcript="",
+                    sttModel=getattr(agent.provider, "stt_model", "unknown"),
+                    ignored=True, ignoreReason="probable_playback_echo", response_sources=[],
+                    echoEvidence=echo_evidence)
+            with trace.span("vad"):
+                residual_speech = _speech_evidence(clean_audio)
+            trace.event("playback.residual", **echo_evidence, speechEvidence=residual_speech)
+            if residual_speech is not None and _is_confident_no_speech(None, residual_speech):
+                return _finish_response(agent, trace, "", None, transcript="",
+                    sttModel=getattr(agent.provider, "stt_model", "unknown"),
+                    ignored=True, ignoreReason="probable_playback_echo", response_sources=[],
+                    speechEvidence=residual_speech, echoEvidence=echo_evidence)
+            if residual_speech is not None:
+                audio, content_type = clean_audio, "audio/wav"
+                speech_evidence = residual_speech
+        if speech_evidence is None:
             with trace.span("vad"):
                 speech_evidence = _speech_evidence(audio)
-            trace.event("vad.evidence", available=speech_evidence is not None, **(speech_evidence or {}))
-            if speech_evidence is not None and _is_confident_no_speech(None, speech_evidence):
-                trace.event("stt.no_speech_suppressed", detector="silero")
-                return _finish_response(
-                    agent, trace, "", None, transcript="",
-                    sttModel=getattr(agent.provider, "stt_model", "unknown"),
-                    ignored=True, ignoreReason="no_speech", response_sources=[],
-                    speechEvidence=speech_evidence,
-                )
-            audio_file = BytesIO(audio)
-            if "mp4" in content_type:
-                audio_file.name = "caller.mp4"
-            elif "ogg" in content_type:
-                audio_file.name = "caller.ogg"
-            else:
-                audio_file.name = "caller.webm"
-            with trace.span("stt", model=getattr(agent.provider, "stt_model", "unknown")):
-                transcription_args = {
-                    "model": agent.provider.stt_model,
-                    "file": audio_file,
-                    # Whisper exposes silence/confidence metadata without
-                    # changing the configured model. Other STT APIs keep text.
-                    "response_format": "verbose_json" if agent.provider.stt_model.startswith("whisper-") else "text",
-                }
-                stt_prompt = getattr(agent.provider, "stt_prompt", "")
-                if stt_prompt:
-                    transcription_args["prompt"] = stt_prompt
-                stt = agent.provider.client.audio.transcriptions.create(**transcription_args)
-            transcript = (stt if isinstance(stt, str) else stt.text).strip()
-            no_speech = _is_confident_no_speech(stt, speech_evidence)
-            segments = getattr(stt, "segments", None) or []
-            trace.event("stt.confidence", segments=[
-                {key: segment.get(key) if isinstance(segment, dict) else getattr(segment, key, None)
-                 for key in ("no_speech_prob", "avg_logprob")}
-                for segment in segments
-            ])
-        if no_speech:
-            trace.event("stt.no_speech_suppressed")
+        trace.event("vad.evidence", available=speech_evidence is not None, **(speech_evidence or {}))
+        if speech_evidence is not None and _is_confident_no_speech(None, speech_evidence):
+            trace.event("stt.no_speech_suppressed", detector="silero")
             return _finish_response(
-                agent, trace, "", None,
-                transcript=transcript,
+                agent, trace, "", None, transcript="",
                 sttModel=getattr(agent.provider, "stt_model", "unknown"),
                 ignored=True, ignoreReason="no_speech", response_sources=[],
-            )
-        # Speaker bleed often arrives as a normal turn right after TTS ends, not
-        # only as an X-Barge-In interrupt. Suppress only clear playback copies —
-        # never drop a deliberate barge-in / courtesy like "நன்றி".
-        if (was_barge_in or after_playback or check_only) and _is_probable_playback_echo(
-            transcript,
-            _last_spoken_text(session_id),
-            barge_in=was_barge_in or check_only,
-        ):
-            trace.event(
-                "barge_in.echo_suppressed",
-                transcript=transcript,
-                afterPlayback=after_playback,
-                wasBargeIn=was_barge_in,
-            )
-            return _finish_response(
-                agent,
-                trace,
-                "",
-                None,
-                transcript=transcript,
-                sttModel=getattr(agent.provider, "stt_model", "unknown"),
-                ignored=True,
-                ignoreReason="probable_playback_echo",
-                response_sources=[],
                 speechEvidence=speech_evidence,
             )
-        if check_only:
-            trace.event("barge_in.input_confirmed")
-            return _finish_response(
-                agent, trace, "", None, transcript=transcript,
-                inputConfirmed=True, response_sources=[],
-                sttModel=getattr(agent.provider, "stt_model", "unknown"),
-                speechEvidence=speech_evidence,
-            )
+        audio_file = BytesIO(audio)
+        if "wav" in content_type:
+            audio_file.name = "caller.wav"
+        elif "mp4" in content_type:
+            audio_file.name = "caller.mp4"
+        elif "ogg" in content_type:
+            audio_file.name = "caller.ogg"
+        else:
+            audio_file.name = "caller.webm"
+        with trace.span("stt", model=getattr(agent.provider, "stt_model", "unknown")):
+            transcription_args = {
+                "model": agent.provider.stt_model,
+                "file": audio_file,
+                # Whisper exposes silence/confidence metadata without
+                # changing the configured model. Other STT APIs keep text.
+                "response_format": "verbose_json" if agent.provider.stt_model.startswith("whisper-") else "text",
+            }
+            stt_prompt = getattr(agent.provider, "stt_prompt", "")
+            if stt_prompt:
+                transcription_args["prompt"] = stt_prompt
+            stt = agent.provider.client.audio.transcriptions.create(**transcription_args)
+        transcript = (stt if isinstance(stt, str) else stt.text).strip()
+        no_speech = _is_confident_no_speech(stt, speech_evidence)
+        segments = getattr(stt, "segments", None) or []
+        trace.event("stt.confidence", segments=[
+            {key: segment.get(key) if isinstance(segment, dict) else getattr(segment, key, None)
+             for key in ("no_speech_prob", "avg_logprob")}
+            for segment in segments
+        ])
+    if no_speech:
+        trace.event("stt.no_speech_suppressed")
+        return _finish_response(
+            agent, trace, "", None,
+            transcript=transcript,
+            sttModel=getattr(agent.provider, "stt_model", "unknown"),
+            ignored=True, ignoreReason="no_speech", response_sources=[],
+        )
+    if _is_weak_truncated_playback_echo(echo_evidence, speech_evidence, stt):
+        trace.event("playback.echo_suppressed", reason="weak_truncated_residual", **echo_evidence)
+        return _finish_response(
+            agent, trace, "", None, transcript="",
+            sttModel=getattr(agent.provider, "stt_model", "unknown"),
+            ignored=True, ignoreReason="probable_playback_echo", response_sources=[],
+            speechEvidence=speech_evidence, echoEvidence=echo_evidence,
+        )
+    if ((was_barge_in or after_playback or check_only)
+            and _is_correlated_residual_echo(
+                transcript, _last_spoken_text(session_id), echo_evidence, speech_evidence,
+            )):
+        trace.event("playback.echo_suppressed", reason="correlated_spoken_fragment", **(echo_evidence or {}))
+        return _finish_response(
+            agent, trace, "", None, transcript="",
+            sttModel=getattr(agent.provider, "stt_model", "unknown"),
+            ignored=True, ignoreReason="probable_playback_echo", response_sources=[],
+            speechEvidence=speech_evidence, echoEvidence=echo_evidence,
+        )
+    # Speaker bleed often arrives as a normal turn right after TTS ends, not
+    # only as an X-Barge-In interrupt. Suppress only clear playback copies —
+    # never drop a deliberate barge-in / courtesy like "நன்றி".
+    last_spoken = _last_spoken_text(session_id)
+    probable_echo = _is_probable_playback_echo(
+        transcript, last_spoken, barge_in=was_barge_in or check_only,
+        echo_evidence=echo_evidence,
+    )
+    numeric_echo = ((was_barge_in or check_only)
+                    and _is_correlated_numeric_echo(transcript, last_spoken, echo_evidence))
+    if (was_barge_in or after_playback or check_only) and (probable_echo or numeric_echo):
+        trace.event(
+            "barge_in.echo_suppressed",
+            transcript=transcript,
+            afterPlayback=after_playback,
+            wasBargeIn=was_barge_in,
+            correlatedNumericFragment=numeric_echo,
+        )
+        return _finish_response(
+            agent,
+            trace,
+            "",
+            None,
+            transcript=transcript,
+            sttModel=getattr(agent.provider, "stt_model", "unknown"),
+            ignored=True,
+            ignoreReason="probable_playback_echo",
+            response_sources=[],
+            speechEvidence=speech_evidence,
+        )
+    if check_only:
+        trace.event("barge_in.input_confirmed")
+        return _finish_response(
+            agent, trace, "", None, transcript=transcript,
+            inputConfirmed=True, response_sources=[],
+            sttModel=getattr(agent.provider, "stt_model", "unknown"),
+            speechEvidence=speech_evidence,
+        )
+    # Do not let noise or playback echo supersede a useful response that is
+    # still being prepared. A generation becomes active only after speech has
+    # passed local VAD, transcription, and playback-echo checks.
+    _admit_generation(session_id, generation)
+    with lock:
+        _apply_delivery_feedback(agent, session_id)
+        stale = _discard_superseded(agent, trace, session_id, turn_id, generation)
+        if stale is not None:
+            return stale
         if was_barge_in:
             trace.event("barge_in.turn_started")
         reply, action = agent.respond(transcript, trace=trace)
+        _register_delivery(agent, session_id, turn_id, reply, generation)
+        stale = _discard_superseded(agent, trace, session_id, turn_id, generation)
+        if stale is not None:
+            return stale
         tts = _browser_tts_payload(agent, trace, reply)
-    _remember_spoken(session_id, reply)
-    return _finish_response(
-        agent,
-        trace,
-        reply,
-        action,
-        transcript=transcript,
-        sttModel=getattr(agent.provider, "stt_model", "unknown"),
-        **tts,
-    )
+        stale = _discard_superseded(agent, trace, session_id, turn_id, generation)
+        if stale is not None:
+            return stale
+        _remember_spoken(session_id, reply)
+        _remember_audio(session_id, turn_id, tts)
+        return _finish_response(
+            agent,
+            trace,
+            reply,
+            action,
+            transcript=transcript,
+            responseTurnId=turn_id,
+            sttModel=getattr(agent.provider, "stt_model", "unknown"),
+            **tts,
+        )
 
 
 def _normalize_utterance(text: str) -> str:
@@ -443,6 +716,171 @@ def _normalize_utterance(text: str) -> str:
     for mark in ("'", ".", ",", "!", "?", "¡", "¿", "।", "…", ";", ":"):
         stripped = stripped.replace(mark, "")
     return " ".join(stripped.split())
+
+
+def _is_correlated_numeric_echo(transcript: str, spoken: str, evidence: dict | None) -> bool:
+    """Catch short numeric STT fragments from a strong, loud playback residual."""
+    if not evidence:
+        return False
+    try:
+        correlation = float(evidence.get("correlation", 0))
+        residual_fraction = float(evidence.get("residualEnergyFraction", 1))
+        residual_gain = float(evidence.get("residualGain", 4))
+    except (TypeError, ValueError):
+        return False
+    if correlation < 0.70 or residual_fraction < 0.15 or residual_gain > 1.5:
+        return False
+    transcript_numbers = re.findall(r"\d+", transcript)
+    spoken_numbers = re.findall(r"\d+", spoken)
+    if not transcript_numbers or not spoken_numbers:
+        return False
+    # Whisper commonly attaches a one-word lead-in to a clipped price
+    # ("for 189" from "$189 per night"). Treat it as a numeric fragment only
+    # when the rest of the transcript is an acoustic stub; explicit caller
+    # corrections and complete room selections remain eligible.
+    normalized = _normalize_utterance(transcript)
+    context_words = re.findall(r"[a-z]+", normalized)
+    if {"no", "not", "actually", "instead", "rather", "change", "correct",
+            "said", "meant", "should", "make", "want", "need", "how", "about"}.intersection(context_words):
+        return False
+    if {"standard", "queen", "king", "deluxe", "suite", "family", "accessible",
+            "harbor", "view", "room"}.intersection(context_words):
+        return False
+    if len(context_words) > 3:
+        return False
+    if any(len(number) >= 2 and len(spoken_number) > len(number) and number in spoken_number
+           for number in transcript_numbers for spoken_number in spoken_numbers):
+        return True
+    # A loud correlated residue can add or replace a digit as well as drop
+    # one (the browser reproduced "$1,999" from a spoken "$199").
+    digits = "".join(transcript_numbers)
+    for number in spoken_numbers:
+        if len(digits) == 1 and digits in number:
+            return True
+        if (min(len(digits), len(number)) >= 2
+                and abs(len(digits) - len(number)) <= 1
+                and SequenceMatcher(None, digits, number).ratio() >= .34):
+            return True
+        if min(len(digits), len(number)) < 3:
+            continue
+        if len(digits) == len(number) and sum(a != b for a, b in zip(digits, number)) <= 2:
+            return True
+        longer, shorter = sorted((digits, number), key=len, reverse=True)
+        if len(longer) == len(shorter) + 1 and any(
+                longer[:index] + longer[index + 1:] == shorter for index in range(len(longer))):
+            return True
+    return False
+
+
+def _is_correlated_residual_echo(
+    transcript: str, spoken: str, evidence: dict | None, speech: dict | None,
+) -> bool:
+    """Reject ASR fragments that track playback but survive imperfect subtraction.
+
+    Residual Silero can still report speech on a loud speaker copy because tiny
+    alignment errors retain the reply's voiced envelope. Strong correlation,
+    small residual energy, and a close match to the reply identify that case;
+    very short independent answers and named room choices remain eligible.
+    """
+    if not evidence or not speech:
+        return False
+    try:
+        correlation = float(evidence.get("correlation", 0))
+        residual_fraction = float(evidence.get("residualEnergyFraction", 1))
+        residual_gain = float(evidence.get("residualGain", 1))
+        if (correlation < .98 or residual_fraction > .03 or residual_gain < 3
+                or float(speech.get("voicedFraction", 0)) < .7):
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    candidate = _normalize_utterance(transcript)
+    spoken_norm = _normalize_utterance(spoken)
+    if not candidate or not spoken_norm:
+        return False
+    words = candidate.split()
+    if any(marker in words for marker in (
+        "no", "not", "actually", "instead", "rather", "change", "correct",
+    )):
+        return False
+
+    # Preserve meaningful room selections even when the agent is saying the
+    # same options; the fixture repeatedly heard these while presenting them.
+    selections = {
+        "standard queen", "king room", "standard room", "queen room",
+        "deluxe king", "family room", "accessible room", "ocean view", "garden view",
+    }
+    caller_words = [word for word in words if word not in {"a", "an", "the", "please", "i", "want", "need"}]
+    if any(selection in " ".join(caller_words) for selection in selections):
+        return False
+
+    candidate_numbers = re.findall(r"\d+", candidate)
+    spoken_numbers = re.findall(r"\d+", spoken_norm)
+    if candidate_numbers and spoken_numbers:
+        # Whisper may turn the last audible digit into a short numeric stub or
+        # substitute digits while the speaker is still dominant. Explicit
+        # corrections above remain caller turns.
+        for number in candidate_numbers:
+            for source in spoken_numbers:
+                if number in source or source in number:
+                    return True
+                if min(len(number), len(source)) >= 2:
+                    longer, shorter = sorted((number, source), key=len, reverse=True)
+                    if len(longer) - len(shorter) <= 1 and sum(a != b for a, b in zip(longer, shorter)) <= 2:
+                        return True
+
+    # When subtraction leaves less than 1% of the mic energy and the 1 kHz
+    # reference still correlates above .995, residual Silero can report speech
+    # on playback artifacts that Whisper turns into unrelated short phrases
+    # (observed as "Aurora Hotel" during a room-rate list). Clear corrections,
+    # choices and numbers above remain caller input.
+    if correlation >= .995 and residual_fraction <= .008 and residual_gain >= 3:
+        return True
+
+    # Small deterministic spelling confusion observed for the spoken room
+    # option: “a Deluxe King” is often heard as “a delight.” Only apply it
+    # under the strict acoustic evidence gate above.
+    if "deluxe king" in spoken_norm and candidate in {"a delight", "delight", "a deluxe", "deluxe"}:
+        return True
+    # Whisper can replace several words in a residual fragment while keeping
+    # its timing and surrounding phrase. Compare local windows rather than
+    # requiring the whole assistant response to match.
+    tokens = candidate.split()
+    if len(tokens) >= 4:
+        source = spoken_norm.split()
+        for start in range(len(source)):
+            for width in range(max(3, len(tokens) - 2), len(tokens) + 3):
+                fragment = " ".join(source[start:start + width])
+                if fragment and SequenceMatcher(None, candidate, fragment).ratio() >= .78:
+                    return True
+    return False
+
+
+def _is_weak_truncated_playback_echo(
+    evidence: dict | None, speech_evidence: dict | None, stt,
+) -> bool:
+    """Reject weak Whisper fragments after only a tiny interrupted audio prefix."""
+    if not evidence or not speech_evidence or not getattr(stt, "segments", None):
+        return False
+    try:
+        if (not evidence.get("truncatedPlayback")
+                or float(evidence.get("correlation", 0)) < .82
+                or float(evidence.get("matchedMs", 0)) > 350
+                or float(evidence.get("residualEnergyFraction", 1)) < .35
+                or float(evidence.get("residualGain", 4)) > 2.5
+                or float(speech_evidence.get("voicedFraction", 1)) > .3):
+            return False
+    except (TypeError, ValueError):
+        return False
+    for segment in stt.segments:
+        value = segment.get if isinstance(segment, dict) else lambda key: getattr(segment, key, None)
+        silence = value("no_speech_prob")
+        confidence = value("avg_logprob")
+        if not isinstance(silence, (int, float)) or not isinstance(confidence, (int, float)):
+            return False
+        if silence > .4 or confidence > -1.0:
+            return False
+    return True
 
 
 # Whisper / browser-TTS hallucinations only — not real caller courtesies.
@@ -482,6 +920,7 @@ def _is_probable_playback_echo(
     spoken: str = "",
     *,
     barge_in: bool = False,
+    echo_evidence: dict | None = None,
 ) -> bool:
     """Ignore audio that is only Aurora's own speaker playback coming back.
 
@@ -523,6 +962,24 @@ def _is_probable_playback_echo(
         # Novel interruption words must survive even when mixed with echo.
         if any(word in {"wait", "stop", "tamil", "english"} and word not in spoken_words for word in tokens):
             return False
+        # Strong reference correlation can leave a speech-like residual that
+        # Whisper hears as a near-match (for example, "stand-up" for "standard").
+        # Preserve short answers and topic questions, but reject longer phrases
+        # that closely track playback when the residual was not boosted like
+        # quiet caller speech.
+        if echo_evidence and len(tokens) >= 4:
+            try:
+                correlated = float(echo_evidence.get("correlation", 0)) >= 0.9
+                residual_gain = float(echo_evidence.get("residualGain", 4))
+            except (TypeError, ValueError):
+                correlated, residual_gain = False, 4
+            if correlated and residual_gain <= 3.2:
+                spoken_tokens = spoken_norm.split()
+                for start in range(len(spoken_tokens)):
+                    for width in range(max(3, len(tokens) - 1), len(tokens) + 3):
+                        fragment = " ".join(spoken_tokens[start:start + width])
+                        if fragment and SequenceMatcher(None, normalized, fragment).ratio() >= 0.80:
+                            return True
         if len(tokens) >= 2 and normalized in spoken_norm:
             return True
         if len(tokens) >= 3:
@@ -640,6 +1097,23 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         session_id = self.headers.get("X-Session-ID", "browser-demo")
         turn_id = self.headers.get("X-Turn-ID")
+        if parsed.path == "/playback-state":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 4096:
+                    raise ValueError("Invalid playback state length")
+                payload = json.loads(self.rfile.read(length))
+                generation = payload.get("generation")
+                if generation is not None and (type(generation) is not int or not 0 <= generation <= 1000000):
+                    raise ValueError("Invalid request generation")
+                heard_through_ms = payload.get("heardThroughMs")
+                playback_duration_ms = payload.get("playbackDurationMs")
+                result = _playback_feedback(session_id, str(payload.get("turnId", "")),
+                                            payload.get("state"), generation,
+                                            heard_through_ms, playback_duration_ms)
+                return self._send_json(result)
+            except (ValueError, TypeError):
+                return self._send_json({"error": "Invalid playback state"}, status=400)
         if parsed.path == "/reset":
             _reset_session(session_id)
             return self._send_json({"reset": True, "sessionId": session_id})
@@ -675,7 +1149,7 @@ class Handler(SimpleHTTPRequestHandler):
             text = str(payload.get("text", "")).strip()
             if not text:
                 raise ValueError("Missing text")
-            response = _agent_reply(text, session_id, turn_id)
+            response = _agent_reply(text, session_id, turn_id, self._request_generation())
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=500)
             return
@@ -719,11 +1193,38 @@ class Handler(SimpleHTTPRequestHandler):
                 after_playback,
                 check_only,
                 client_timings,
+                self._request_generation(),
+                self.headers.get("X-Playback-Reference-ID"),
+                self._playback_offset(),
+                self._playback_through(),
             )
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=500)
             return
         self._send_json(response)
+
+    def _playback_offset(self) -> float | None:
+        try:
+            value = float(self.headers.get("X-Playback-Offset-Ms", ""))
+            return value if math.isfinite(value) and -1000 <= value <= 180000 else None
+        except ValueError:
+            return None
+
+    def _playback_through(self) -> float | None:
+        try:
+            value = float(self.headers.get("X-Playback-Through-Ms", ""))
+            return value if math.isfinite(value) and 0 <= value <= 180000 else None
+        except ValueError:
+            return None
+
+    def _request_generation(self) -> int | None:
+        value = self.headers.get("X-Request-Generation")
+        if value is None:
+            return None
+        generation = int(value)
+        if not 0 <= generation <= 1000000:
+            raise ValueError("Invalid request generation")
+        return generation
 
     def _send_json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload).encode("utf-8")

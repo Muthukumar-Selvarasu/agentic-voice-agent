@@ -1,12 +1,11 @@
 import { Room, Track } from "/node_modules/livekit-client/dist/livekit-client.esm.mjs";
+import { PcmCapture } from "/web/pcm_capture.js";
 
 const callerRoot = document.querySelector('[data-client="caller"]');
 const agentRoot = document.querySelector('[data-client="agent"]');
 const callerStatus = callerRoot.querySelector('[data-role="status"]');
 const agentStatus = agentRoot.querySelector('[data-role="status"]');
 const startButton = document.querySelector("#start-call");
-const interruptButton = document.querySelector("#interrupt-call");
-const muteButton = document.querySelector("#mute-call");
 const endButton = document.querySelector("#end-call");
 const providerEl = document.querySelector("#provider");
 const languageEl = document.querySelector("#language");
@@ -24,7 +23,16 @@ const vadReadout = document.querySelector("#vad-readout");
 const typedTurnForm = document.querySelector("#typed-turn");
 const typedTurnInput = document.querySelector("#typed-turn-input");
 
-const sessionId = `browser-${crypto.randomUUID()}`;
+let sessionId = `browser-${crypto.randomUUID()}`;
+let callEpoch = 0;
+let requestGeneration = 0;
+let activeTurnRequest = null;
+let activeOutput = null;
+let lastOutputReference = null;
+let currentRecordingReference = null;
+let pcmCapture = null;
+let pcmNode = null;
+let recalibrateAfterTurn = false;
 let turnCounter = 0;
 let callerRoom = null;
 let agentRoom = null;
@@ -45,18 +53,17 @@ let lastBargeHitAt = 0;
 let listenCooldownUntil = 0;
 let agentBusy = false;
 let agentSpeaking = false;
-let muted = false;
 let noiseFloor = 0.008;
 let smoothedLevel = 0;
 let discardRecording = false;
 let lastEndpointAt = 0;
 let playbackStartedAt = 0;
 let playbackEndedAt = 0;
+let playbackReferenceHoldUntil = 0;
 let playbackEchoFloor = 0.012;
 let playbackEchoPeak = 0.02;
 let turnMaxLevel = 0;
-let audioMode = "speaker";
-let pendingBargeInTurn = false;
+let audioMode = "auto";
 let currentTurnWasBargeIn = false;
 let currentTurnAfterPlayback = false;
 let activeAgentAudio = null;
@@ -94,9 +101,10 @@ const tuning = {
   maxTurnMs: 25000,
 };
 
-/** Longer multi-clause answers need more pause room than short yes/no replies. */
+/** Automatic turns honor the configured pause window regardless of their length. */
 function effectiveEndpointSilenceMs(turnDurationMs) {
   const base = tuning.endpointSilenceMs;
+  if (audioMode === "auto") return base;
   if (turnDurationMs < 1500) return base;
   const extra = Math.min(550, Math.floor((turnDurationMs - 1500) * 0.28));
   return base + extra;
@@ -119,7 +127,17 @@ function resetListeningCalibration(reason = "mode_change") {
 function applyAudioMode(mode) {
   rejectBargeProbe("mode_change");
   audioMode = mode;
-  if (mode === "speaker") {
+  if (mode === "auto") {
+    // The same speech-confirmed path works for speakers and headphones.
+    // Reassign every automatic default so switching from a preset is stable.
+    tuning.speechConfirmationMs = 100;
+    tuning.bargeInConfirmationMs = 80;
+    tuning.bargeInArmMs = 140;
+    tuning.postPlaybackHoldMs = 0;
+    tuning.afterPlaybackEchoMs = 1200;
+    tuning.playbackVolume = 0.3;
+    if (audioModeValue) audioModeValue.textContent = "Automatic";
+  } else if (mode === "speaker") {
     // Tuned for laptop speaker: harder barge gate so playback echo does not self-interrupt.
     tuning.speechConfirmationMs = 140;
     tuning.bargeInConfirmationMs = 220;
@@ -142,29 +160,16 @@ function applyAudioMode(mode) {
   }
   resetListeningCalibration(mode);
   if (activeAgentAudio) activeAgentAudio.volume = tuning.playbackVolume;
-  if (muted && listenStream) {
-    setListeningState("Muted", "Unmute to speak — microphone input is paused.");
-  } else if (listenStream && !agentSpeaking && !agentBusy) {
+  if (listenStream && !agentSpeaking && !agentBusy) {
     setListeningState("Listening", "Speak naturally. Aurora can be interrupted while talking.");
   }
 }
 
 function setCallControls(connected) {
   startButton.disabled = connected;
-  muteButton.disabled = !connected;
   endButton.disabled = !connected;
-  if (interruptButton) {
-    interruptButton.disabled = !connected || !agentSpeaking;
-    interruptButton.classList.toggle("interrupt-ready", connected && agentSpeaking);
-  }
   callerRoot.classList.toggle("connected", connected);
   agentRoot.classList.toggle("connected", connected);
-}
-
-function setInterruptEnabled(enabled) {
-  if (!interruptButton) return;
-  interruptButton.disabled = !listenStream || !enabled;
-  interruptButton.classList.toggle("interrupt-ready", Boolean(listenStream && enabled));
 }
 
 function setListeningState(state, detail) {
@@ -202,7 +207,7 @@ function addInterruption() {
   transcriptEl.querySelector(".empty")?.remove();
   const item = document.createElement("div");
   item.className = "turn interruption";
-  item.textContent = "Caller interrupted agent playback";
+  item.textContent = "Caller spoke before Aurora finished";
   transcriptEl.appendChild(item);
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
@@ -263,12 +268,119 @@ function armAgentOutput(token, backend) {
   bargeRecordingCandidate = false;
   if (recorder && !currentTurnWasBargeIn) stopTurnRecording(true);
   agentRoot.classList.add("speaking");
-  setInterruptEnabled(true);
   setListeningState("Agent speaking", "Speak over Aurora to interrupt.");
   schedulePlaybackWatchdog(token, 20000);
 }
 
+function currentPlaybackPosition(output = activeOutput, audio = activeAgentAudio) {
+  if (!output?.turnId || output !== activeOutput || !audio) return {};
+  const playedMs = Number(audio.currentTime) * 1000;
+  const durationMs = Number(audio.duration) * 1000;
+  if (!Number.isFinite(playedMs) || !Number.isFinite(durationMs) || durationMs <= 0) return {};
+  return { heardThroughMs: Math.min(durationMs, Math.max(0, playedMs)), playbackDurationMs: durationMs };
+}
+
+function playbackFeedback(output, state, generation = requestGeneration, progress = null) {
+  if (!output?.turnId) return Promise.resolve();
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 2000);
+  const position = state === "interrupted" || state === "completed"
+    ? (progress || currentPlaybackPosition(output)) : {};
+  return fetch("/playback-state", { method: "POST", keepalive: true, signal: controller.signal,
+    headers: { "Content-Type": "application/json", "X-Session-ID": output.sessionId },
+    body: JSON.stringify({ turnId: output.turnId, state, generation, ...position }),
+  }).catch(() => appendRuntimeEvent("playback.feedback_failed"))
+    .finally(() => window.clearTimeout(timeout));
+}
+
+function isCurrentRequest(request) {
+  return activeTurnRequest === request && !request.cancelled
+    && request.generation === requestGeneration && request.sessionId === sessionId
+    && request.playbackToken === playbackToken;
+}
+
+function cancelPendingTurn(reason) {
+  const request = activeTurnRequest;
+  if (!request) return Promise.resolve();
+  request.cancelled = true;
+  request.controller.abort();
+  request.pending?.remove();
+  request.placeholder?.remove();
+  activeTurnRequest = null;
+  agentBusy = false;
+  requestGeneration++;
+  appendRuntimeEvent(`turn.superseded | ${reason}`);
+  return playbackFeedback(request, "discarded");
+}
+
+function beginTurnRequest(kind) {
+  const request = { turnId: `turn-${++turnCounter}`, generation: ++requestGeneration,
+    sessionId, playbackToken, kind, controller: new AbortController(), cancelled: false,
+    startedAt: Date.now() };
+  activeTurnRequest = request;
+  agentBusy = true;
+  return request;
+}
+
+function completeTurnRequest(request, payload) {
+  if (!isCurrentRequest(request)) return;
+  if (recorder?.state === "recording" || bargeProbe) {
+    request.payload = payload;
+    appendRuntimeEvent("turn.response_held_for_caller");
+    return;
+  }
+  request.pending?.remove();
+  request.placeholder?.remove();
+  activeTurnRequest = null;
+  agentBusy = false;
+  if (payload.ignored) {
+    appendRuntimeEvent(`audio.suppressed | ${payload.ignoreReason}`);
+    if (request.wasBargeIn && resumeSuspendedPlayback(payload.ignoreReason)) return;
+    setListeningState(listenStream ? "Listening" : "Idle", "Speak naturally, or send a message.");
+    return;
+  }
+  if (request.wasBargeIn && request.detectedAt) commitBargeIn(request.detectedAt);
+  applyAgentPayload(payload, { callerLabel: payload.transcript || request.text || "",
+    callerMeta: request.kind === "typed" ? "typed" : `STT: ${payload.sttModel}`,
+    turnId: request.turnId });
+}
+
+function maybeDeliverHeldResponse() {
+  if (activeTurnRequest?.payload) completeTurnRequest(activeTurnRequest, activeTurnRequest.payload);
+}
+
+function rememberOutputReference() {
+  if (activeOutput && activeAgentAudio) {
+    lastOutputReference = { id: activeOutput.turnId, offsetMs: activeAgentAudio.currentTime * 1000,
+      at: Date.now() };
+  }
+}
+
+function playbackReferenceHeaders(reference = currentRecordingReference, playbackThroughMs = null) {
+  if (!reference) return {};
+  const headers = { "X-Playback-Reference-ID": reference.id,
+    "X-Playback-Offset-Ms": String(reference.offsetMs) };
+  if (Number.isFinite(playbackThroughMs) && playbackThroughMs >= 0) {
+    headers["X-Playback-Through-Ms"] = String(playbackThroughMs);
+  }
+  return headers;
+}
+
+function recordingBlob(turnRecorder = recorder) {
+  return turnRecorder?.formatRecording
+    ? turnRecorder.formatRecording(recordedChunks)
+    : new Blob(recordedChunks, { type: turnRecorder?.mimeType || "audio/webm" });
+}
+
 function stopAgentPlayback() {
+  const stoppingOutput = Boolean(activeOutput);
+  rememberOutputReference();
+  const feedback = playbackFeedback(activeOutput, "interrupted");
+  if (stoppingOutput) {
+    playbackEndedAt = Date.now();
+    playbackReferenceHoldUntil = playbackEndedAt + 8000;
+  }
+  activeOutput = null;
   clearPlaybackWatchdog();
   playbackWatchdogRemainingMs = 0;
   playbackToken += 1;
@@ -288,6 +400,7 @@ function stopAgentPlayback() {
     activeAgentAudio.removeAttribute("src");
     activeAgentAudio = null;
   }
+  return feedback;
 }
 
 function beginAgentPlayback(token, backend) {
@@ -295,9 +408,9 @@ function beginAgentPlayback(token, backend) {
   if (token !== playbackToken || playbackHasStarted) return;
   playbackHasStarted = true;
   playbackBackend = backend;
+  playbackReferenceHoldUntil = 0;
   agentSpeaking = true;
   agentRoot.classList.add("speaking");
-  setInterruptEnabled(true);
   playbackStartedAt = Date.now();
   playbackEchoFloor = Math.max(noiseFloor, 0.012);
   playbackEchoPeak = Math.max(smoothedLevel, 0.02);
@@ -322,14 +435,17 @@ function beginAgentPlayback(token, backend) {
   setListeningState(
     "Agent speaking",
     audioMode === "speaker"
-      ? "Speak now to interrupt, or click Interrupt / press Space."
+      ? "Speak over Aurora to interrupt."
       : "Speak over Aurora to interrupt.",
   );
 }
 
 function finishAgentPlayback(token) {
   if (token !== playbackToken) return;
+  rememberOutputReference();
   clearPlaybackWatchdog();
+  playbackFeedback(activeOutput, "completed");
+  activeOutput = null;
   appendRuntimeEvent(`tts.playback_ended | ${playbackBackend}`);
   // A candidate may have captured only the final syllable of Aurora's reply.
   // Do not promote that pre-roll to a caller turn just because output ended.
@@ -343,8 +459,8 @@ function finishAgentPlayback(token) {
   activeAgentAudio = null;
   agentSpeaking = false;
   agentRoot.classList.remove("speaking");
-  setInterruptEnabled(false);
   playbackEndedAt = Date.now();
+  playbackReferenceHoldUntil = 0;
   // Hold off listening until speaker reverb decays; stops self-turns after TTS.
   listenCooldownUntil = playbackEndedAt + tuning.postPlaybackHoldMs;
   bargeCandidateAt = unconfirmedCandidate ? bargeCandidateAt : 0;
@@ -398,7 +514,7 @@ function speakWithBrowserVoice(text, locale, token) {
   if (!playbackHasStarted) beginAgentPlayback(token, "browser");
 }
 
-function speak(text, locale = "en-US", audioBase64 = "", audioContentType = "audio/wav") {
+function speak(text, locale = "en-US", audioBase64 = "", audioContentType = "audio/wav", output = null) {
   // Do not play a completed older reply over a confirmed ongoing caller.
   if (recorder?.state === "recording" && currentTurnWasBargeIn && !bargeRecordingCandidate && !bargeProbe) {
     appendRuntimeEvent("tts.skipped_during_barge");
@@ -406,6 +522,7 @@ function speak(text, locale = "en-US", audioBase64 = "", audioContentType = "aud
   }
   stopAgentPlayback();
   const token = playbackToken;
+  activeOutput = output;
   armAgentOutput(token, audioBase64 ? "audio" : "browser");
   if (!audioBase64) {
     speakWithBrowserVoice(text, locale, token);
@@ -444,34 +561,6 @@ function speak(text, locale = "en-US", audioBase64 = "", audioContentType = "aud
   audio.play().catch(fallback);
 }
 
-function forceInterrupt() {
-  if (!listenStream) return;
-  const isSpeaking = agentSpeaking
-    || ("speechSynthesis" in window && window.speechSynthesis.speaking)
-    || Boolean(activeAgentAudio);
-
-  if (!isSpeaking && !agentBusy) return;
-  const detectedAt = Date.now();
-  appendRuntimeEvent("barge_in.manual");
-  interruptAgent(detectedAt, Boolean(recorder));
-  if (!recorder) {
-    startTurnRecording(true);
-  }
-  lastSpeechAt = detectedAt;
-}
-
-function interruptAgent(detectedAt, turnAlreadyRecording = false) {
-  stopAgentPlayback();
-  agentSpeaking = false;
-  agentRoot.classList.remove("speaking");
-  setInterruptEnabled(false);
-  playbackEndedAt = Date.now();
-  listenCooldownUntil = 0;
-  pendingBargeInTurn = !turnAlreadyRecording;
-  pendingBargeDetectedAt = detectedAt;
-  setListeningState("Interrupted", "Aurora stopped. Listening to your answer.");
-}
-
 function commitBargeIn(detectedAt) {
   addInterruption();
   appendRuntimeEvent(`barge_in.detected | ${formatMs(Date.now() - detectedAt)}`);
@@ -488,6 +577,13 @@ function audioLevel() {
 }
 
 function thresholds() {
+  if (audioMode === "auto") {
+    const ease = Math.max(1.3, 5.2 - tuning.sensitivity);
+    // Energy starts a recording, never an audible interruption. Neural/STT
+    // evidence rejects noise, allowing this modest gate to retain quiet words.
+    const start = Math.min(0.012, Math.max(0.003, noiseFloor * ease * 0.25));
+    return { start, end: Math.max(0.003, start * 0.4), barge: Math.min(0.012, start), quietFloor: start * 0.9 };
+  }
   if (audioMode === "headset") {
     // Headset mics are quieter than laptop mics. Higher UI sensitivity = easier pickup.
     const ease = Math.max(1.3, 5.6 - tuning.sensitivity);
@@ -518,16 +614,17 @@ function thresholds() {
 // Transcribe captured input while Aurora keeps playing. Only confirmed caller
 // text may pause output; rejected echo must have no audible effect at all.
 async function startBargeProbe(detectedAt) {
-  if (bargeProbe || suspendedPlayback || !recorder || recorder.state !== "recording" || agentBusy || muted) return;
+  if (bargeProbe || (suspendedPlayback && !activeTurnRequest) || !recorder
+      || recorder.state !== "recording" || (agentBusy && !activeTurnRequest)) return;
   const candidateRecorder = recorder;
   const probe = {
     token: playbackToken, detectedAt, startedAt: Date.now(), speechAt: 0,
     echoLevel: smoothedLevel, backend: playbackBackend, audio: activeAgentAudio,
     checking: true, outputFinished: !agentSpeaking,
-    capturedMs: Date.now() - recordingStartedAt,
+    capturedMs: Date.now() - recordingStartedAt, pendingRequest: activeTurnRequest,
   };
   bargeProbe = probe;
-  const audioBlob = new Blob(recordedChunks, { type: candidateRecorder.mimeType || "audio/webm" });
+  const audioBlob = recordingBlob(candidateRecorder);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
   try {
@@ -543,6 +640,8 @@ async function startBargeProbe(detectedAt) {
         "Content-Type": audioBlob.type, "X-Session-ID": sessionId,
         "X-Turn-ID": `check-${++turnCounter}`, "X-Barge-In": "true",
         "X-Playback-Check": "true",
+        ...playbackReferenceHeaders(currentRecordingReference,
+          probe.audio ? probe.audio.currentTime * 1000 : null),
         "X-Capture-Ms": String(probe.capturedMs),
         "X-Onset-To-Check-Ms": String(probe.startedAt - detectedAt),
       },
@@ -577,6 +676,13 @@ async function startBargeProbe(detectedAt) {
       rejectBargeProbe(payload.ignoreReason || "unconfirmed_speech");
       return;
     }
+    if (probe.pendingRequest && activeTurnRequest === probe.pendingRequest) {
+      await cancelPendingTurn("confirmed_caller");
+      if (bargeProbe !== probe || probe.token !== playbackToken || recorder !== candidateRecorder) return;
+    }
+    await playbackFeedback(activeOutput, "interrupted", requestGeneration,
+      currentPlaybackPosition(activeOutput, probe.audio));
+    if (bargeProbe !== probe || probe.token !== playbackToken || recorder !== candidateRecorder) return;
     bargeProbe = null;
     bargeRecordingCandidate = false;
     if (!probe.outputFinished) {
@@ -593,7 +699,6 @@ async function startBargeProbe(detectedAt) {
     }
     agentSpeaking = false;
     agentRoot.classList.remove("speaking");
-    setInterruptEnabled(false);
     playbackEndedAt = Date.now();
     listenCooldownUntil = 0;
     pendingBargeDetectedAt = detectedAt;
@@ -621,7 +726,6 @@ function resumeSuspendedPlayback(reason) {
   suspendedPlayback = null;
   bargeProbe = null;
   pendingBargeDetectedAt = 0;
-  pendingBargeInTurn = false;
   bargeCandidateAt = lastBargeHitAt = 0;
   bargeRecordingCandidate = false;
   if (!paused || paused.token !== playbackToken || !listenStream) return false;
@@ -629,7 +733,6 @@ function resumeSuspendedPlayback(reason) {
   if (audioMode === "speaker") playbackEchoPeak = Math.max(playbackEchoPeak, paused.echoLevel);
   agentSpeaking = true;
   agentRoot.classList.add("speaking");
-  setInterruptEnabled(true);
   playbackStartedAt = Date.now();
   smoothedLevel = 0;
   appendRuntimeEvent(`barge_in.resumed | ${reason}`);
@@ -673,11 +776,11 @@ function maybeStartBargeProbe() {
 }
 
 async function maybeCheckSpeechActivity(force = false) {
-  if (!recorder || recorder.state !== "recording" || muted || speechActivityRequest
+  if (!recorder || recorder.state !== "recording" || speechActivityRequest
       || speechActivity?.available === false) return;
   const now = Date.now();
   if (now - recordingStartedAt < 400 || (!force && now - lastActivityCheckAt < 500)) return;
-  const blob = new Blob(recordedChunks, { type: recorder.mimeType || "audio/webm" });
+  const blob = recordingBlob();
   if (blob.size < 300) return;
   const request = { recorder, capturedAt: now, controller: new AbortController() };
   speechActivityRequest = request;
@@ -709,23 +812,29 @@ async function maybeCheckSpeechActivity(force = false) {
 }
 
 function startTurnRecording(isBargeIn = false) {
-  if (!listenStream || recorder || agentBusy || muted) return false;
+  if (!listenStream || recorder || (agentBusy && !activeTurnRequest)) return false;
   recordedChunks = [];
   discardRecording = false;
   turnMaxLevel = smoothedLevel;
-  recorder = new MediaRecorder(listenStream);
+  recorder = pcmCapture ? pcmCapture.createRecorder() : new MediaRecorder(listenStream);
   const turnRecorder = recorder;
   speechActivity = null;
   lastActivityCheckAt = 0;
   bargeRetryAt = 0;
   bargeRetryCount = 0;
   currentBargeTimings = null;
-  currentTurnWasBargeIn = isBargeIn || pendingBargeInTurn;
-  currentTurnAfterPlayback = Boolean(
-    playbackEndedAt && Date.now() - playbackEndedAt < tuning.afterPlaybackEchoMs,
-  );
-  pendingBargeInTurn = false;
+  currentTurnWasBargeIn = isBargeIn;
+  const afterPlaybackWindow = playbackEndedAt
+    && Date.now() - playbackEndedAt < tuning.afterPlaybackEchoMs;
+  const canceledPlaybackWindow = agentBusy && Date.now() < playbackReferenceHoldUntil;
+  currentTurnAfterPlayback = Boolean(afterPlaybackWindow || canceledPlaybackWindow);
   recordingStartedAt = Date.now();
+  currentRecordingReference = activeOutput && activeAgentAudio && agentSpeaking
+    ? { id: activeOutput.turnId, offsetMs: activeAgentAudio.currentTime * 1000 }
+    : currentTurnAfterPlayback && lastOutputReference
+      ? { id: lastOutputReference.id,
+          offsetMs: lastOutputReference.offsetMs + Date.now() - lastOutputReference.at }
+      : null;
   appendRuntimeEvent(`vad.turn_started | ${currentTurnWasBargeIn ? "barge_candidate" : currentTurnAfterPlayback ? "after_playback" : "caller"}`);
   lastSpeechAt = recordingStartedAt;
   callerRoot.classList.add("speaking");
@@ -737,13 +846,16 @@ function startTurnRecording(isBargeIn = false) {
   recorder.onstop = () => {
     if (recorder !== turnRecorder) return;
     const shouldDiscard = discardRecording;
-    const mimeType = recorder.mimeType || "audio/webm";
-    const audioBlob = new Blob(recordedChunks, { type: mimeType });
+    const audioBlob = recordingBlob(turnRecorder);
     const wasBargeIn = currentTurnWasBargeIn;
     const maxLevel = turnMaxLevel;
     recorder = null;
     recordedChunks = [];
     callerRoot.classList.remove("speaking");
+    if (recalibrateAfterTurn) {
+      recalibrateAfterTurn = false;
+      resetListeningCalibration("device_change");
+    }
     const limit = thresholds();
     const isTooQuiet = !wasBargeIn && !speechActivity?.evidence?.voicedMs && maxLevel < (limit.quietFloor ?? limit.start) * 1.05;
     const minBlobSize = wasBargeIn ? 300 : 500;
@@ -752,6 +864,8 @@ function startTurnRecording(isBargeIn = false) {
       currentTurnWasBargeIn = false;
       currentTurnAfterPlayback = false;
       if (wasBargeIn && resumeSuspendedPlayback("turn_discarded")) return;
+      maybeDeliverHeldResponse();
+      if (activeTurnRequest || agentSpeaking) return;
       if (agentSpeaking) {
         setListeningState("Agent speaking", "Interrupt naturally by speaking over Aurora.");
       } else if (listenStream) {
@@ -764,6 +878,9 @@ function startTurnRecording(isBargeIn = false) {
   };
   try {
     recorder.start(100);
+    recordingStartedAt -= recorder.preRollMs || 0;
+    if (currentRecordingReference) currentRecordingReference.offsetMs -= recorder.preRollMs || 0;
+    vadReadout.dataset.preRollMs = String(recorder.preRollMs || 0);
   } catch {
     recorder = null;
     recordedChunks = [];
@@ -790,7 +907,7 @@ function ttsLabel(payload) {
   return "Browser TTS";
 }
 
-function applyAgentPayload(payload, { callerLabel = "", callerMeta = "" } = {}) {
+function applyAgentPayload(payload, { callerLabel = "", callerMeta = "", turnId = null } = {}) {
   if (callerLabel) addTranscript("caller", callerLabel, callerMeta);
   const ttsMeta = ttsLabel(payload);
   const meta = [payload.language?.toUpperCase(), ttsMeta, payload.action ? `action: ${payload.action}` : ""]
@@ -806,6 +923,7 @@ function applyAgentPayload(payload, { callerLabel = "", callerMeta = "" } = {}) 
     payload.locale || "en-US",
     payload.audioBase64 || "",
     payload.audioContentType || "audio/wav",
+    { turnId: payload.responseTurnId || turnId, sessionId },
   );
   if (payload.action === "transfer") agentStatus.textContent = "Transferring";
   if (payload.action === "hangup") agentStatus.textContent = "Call complete";
@@ -850,101 +968,52 @@ async function isSilentRecording(audioBlob) {
 }
 
 async function sendAudioToAgent(audioBlob) {
-  const requestStartedAt = Date.now();
-  const captureMs = requestStartedAt - recordingStartedAt;
-  vadReadout.dataset.lastTurnTimings = JSON.stringify({
-    source: "voice", endpointAt: lastEndpointAt,
-    endpointAfterLastSpeechMs: lastEndpointAt - lastSpeechAt,
-    endpointMethod: speechActivity?.available ? "silero" : "energy",
-  });
-  const requestPlaybackToken = playbackToken;
-  agentBusy = true;
-  setListeningState("Processing", "Transcribing and running the hotel agent.");
-  const voicePlaceholder = addTranscript("caller", "Voice turn", "transcribing");
-  const pending = addTranscript("agent", "Processing turn", "STT -> Router -> RAG -> LLM -> Tools");
-  const turnId = `turn-${++turnCounter}`;
+  const captureMs = Date.now() - recordingStartedAt;
   const wasBargeIn = currentTurnWasBargeIn;
   const afterPlayback = currentTurnAfterPlayback;
-  currentTurnWasBargeIn = false;
-  currentTurnAfterPlayback = false;
-
+  const reference = currentRecordingReference;
+  const detectedAt = pendingBargeDetectedAt;
+  const timing = { source: "voice", endpointAt: lastEndpointAt,
+    endpointAfterLastSpeechMs: lastEndpointAt - lastSpeechAt,
+    endpointMethod: speechActivity?.available ? "silero" : "energy" };
+  const bargeTiming = currentBargeTimings;
+  currentTurnWasBargeIn = currentTurnAfterPlayback = false;
+  const request = beginTurnRequest("voice");
+  request.wasBargeIn = wasBargeIn;
+  request.detectedAt = detectedAt;
+  request.placeholder = addTranscript("caller", "Voice turn", "transcribing");
+  request.pending = addTranscript("agent", "Processing turn", "Transcribing and preparing a reply");
+  vadReadout.dataset.lastTurnTimings = JSON.stringify(timing);
+  setListeningState("Processing", "Preparing a reply. You can keep speaking.");
   try {
     const silent = await isSilentRecording(audioBlob);
-    if (requestPlaybackToken !== playbackToken) {
-      pending.remove();
-      voicePlaceholder.remove();
-      return;
-    }
+    if (!isCurrentRequest(request)) return;
     if (silent) {
-      pending.remove();
-      voicePlaceholder.remove();
-      pendingBargeDetectedAt = 0;
-      agentBusy = false;
-      appendRuntimeEvent("audio.suppressed | silent_recording");
-      if (wasBargeIn && resumeSuspendedPlayback("silent_recording")) return;
-      setListeningState("Listening", "No speech was detected. Continue speaking naturally.");
+      completeTurnRequest(request, { ignored: true, ignoreReason: "silent_recording" });
       return;
     }
-    const response = await fetch("/voice-agent", {
-      method: "POST",
-      headers: {
-        "Content-Type": audioBlob.type || "audio/webm",
-        "X-Session-ID": sessionId,
-        "X-Turn-ID": turnId,
-        "X-Barge-In": String(wasBargeIn),
-        "X-After-Playback": String(afterPlayback),
-        "X-Capture-Ms": String(captureMs),
-        "X-Endpoint-After-Speech-Ms": String(lastEndpointAt - lastSpeechAt),
-        "X-Endpoint-Method": speechActivity?.available ? "silero" : "energy",
-        ...(wasBargeIn && currentBargeTimings
-          ? { "X-Onset-To-Pause-Ms": String(currentBargeTimings.onsetToPauseMs) } : {}),
-      },
-      body: audioBlob,
-    });
+    const response = await fetch("/voice-agent", { method: "POST", signal: request.controller.signal,
+      headers: { "Content-Type": audioBlob.type || "audio/webm", "X-Session-ID": request.sessionId,
+        "X-Turn-ID": request.turnId, "X-Request-Generation": String(request.generation),
+        "X-Barge-In": String(wasBargeIn), "X-After-Playback": String(afterPlayback),
+        ...playbackReferenceHeaders(reference,
+          activeOutput?.turnId === reference?.id && activeAgentAudio
+            ? activeAgentAudio.currentTime * 1000 : null),
+        "X-Capture-Ms": String(captureMs), "X-Endpoint-After-Speech-Ms": String(timing.endpointAfterLastSpeechMs),
+        "X-Endpoint-Method": timing.endpointMethod,
+        ...(wasBargeIn && bargeTiming ? { "X-Onset-To-Pause-Ms": String(bargeTiming.onsetToPauseMs) } : {}) },
+      body: audioBlob });
     const payload = await response.json();
-    vadReadout.dataset.lastTurnTimings = JSON.stringify({
-      ...JSON.parse(vadReadout.dataset.lastTurnTimings),
-      requestRoundTripMs: Date.now() - requestStartedAt,
-      serverStages: payload.trace?.timings,
-    });
-    pending.remove();
-    if (requestPlaybackToken !== playbackToken) {
-      voicePlaceholder.remove();
-      return;
-    }
+    if (!isCurrentRequest(request)) return;
+    vadReadout.dataset.lastTurnTimings = JSON.stringify({ ...timing,
+      requestRoundTripMs: Date.now() - request.startedAt, serverStages: payload.trace?.timings });
     if (!response.ok) throw new Error(payload.error || `Voice request failed: ${response.status}`);
-
-    if (payload.ignored) {
-      voicePlaceholder.remove();
-      pendingBargeDetectedAt = 0;
-      const candidate = clientEvents.lastIndexOf("barge_in.candidate");
-      if (wasBargeIn && candidate >= 0) clientEvents.splice(candidate, 1);
-      appendRuntimeEvent(`audio.suppressed | ${payload.ignoreReason}`);
-      renderSources([]);
-      agentBusy = false;
-      if (wasBargeIn && resumeSuspendedPlayback(payload.ignoreReason)) return;
-      setListeningState("Listening", payload.ignoreReason === "no_speech"
-        ? "No speech was detected. Continue speaking naturally."
-        : "Playback echo was suppressed. Continue speaking naturally.");
-      return;
-    }
-
-    voicePlaceholder.remove();
-    if (wasBargeIn && pendingBargeDetectedAt) commitBargeIn(pendingBargeDetectedAt);
-    applyAgentPayload(payload, {
-      callerLabel: payload.transcript,
-      callerMeta: `STT: ${payload.sttModel}`,
-    });
-    agentBusy = false;
+    completeTurnRequest(request, payload);
   } catch (error) {
-    pending.remove();
-    voicePlaceholder.remove();
-    if (requestPlaybackToken !== playbackToken) return;
-    agentBusy = false;
-    if (wasBargeIn && suspendedPlayback) {
-      appendRuntimeEvent(`barge_in.request_failed | ${error.message}`);
-      if (resumeSuspendedPlayback("request_failed")) return;
-    }
+    if (!isCurrentRequest(request)) return;
+    request.pending?.remove(); request.placeholder?.remove();
+    activeTurnRequest = null; agentBusy = false;
+    if (wasBargeIn && resumeSuspendedPlayback("request_failed")) return;
     addTranscript("agent", error.message, "error");
     setListeningState("Error", "The turn failed. Speak again to retry.");
   }
@@ -952,40 +1021,37 @@ async function sendAudioToAgent(audioBlob) {
 
 async function sendTextToAgent(text) {
   const cleaned = text.trim();
-  if (!cleaned || agentBusy) return;
-  agentBusy = true;
-  setListeningState("Processing", "Running the hotel agent on a typed turn.");
-  const pending = addTranscript("agent", "Processing turn", "Router -> RAG -> LLM -> Tools");
-  const turnId = `turn-${++turnCounter}`;
-  lastEndpointAt = Date.now();
-  const textRequestStartedAt = lastEndpointAt;
-  vadReadout.dataset.lastTurnTimings = JSON.stringify({ source: "typed", endpointAt: lastEndpointAt });
+  if (!cleaned) return;
+  const epoch = callEpoch;
+  const pendingCancellation = cancelPendingTurn("typed_message");
+  if (bargeProbe) rejectBargeProbe("typed_message");
+  if (recorder) stopTurnRecording(true);
+  const playbackStop = stopAgentPlayback();
+  currentRecordingReference = null;
+  agentSpeaking = false;
+  await Promise.all([pendingCancellation, playbackStop]);
+  if (epoch !== callEpoch) return;
+  const request = beginTurnRequest("typed");
+  request.text = cleaned;
+  request.pending = addTranscript("agent", "Processing message", "Preparing a reply");
+  lastEndpointAt = request.startedAt;
+  setListeningState("Processing", "Preparing a reply. You can keep speaking.");
   try {
-    const response = await fetch("/agent", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Session-ID": sessionId,
-        "X-Turn-ID": turnId,
-      },
-      body: JSON.stringify({ text: cleaned }),
-    });
+    const response = await fetch("/agent", { method: "POST", signal: request.controller.signal,
+      headers: { "Content-Type": "application/json", "X-Session-ID": request.sessionId,
+        "X-Turn-ID": request.turnId, "X-Request-Generation": String(request.generation) },
+      body: JSON.stringify({ text: cleaned }) });
     const payload = await response.json();
-    vadReadout.dataset.lastTurnTimings = JSON.stringify({ source: "typed", endpointAt: textRequestStartedAt,
-      requestRoundTripMs: Date.now() - textRequestStartedAt, serverStages: payload.trace?.timings });
-    pending.remove();
+    if (!isCurrentRequest(request)) return;
+    vadReadout.dataset.lastTurnTimings = JSON.stringify({ source: "typed", endpointAt: request.startedAt,
+      requestRoundTripMs: Date.now() - request.startedAt, serverStages: payload.trace?.timings });
     if (!response.ok) throw new Error(payload.error || `Agent request failed: ${response.status}`);
-    applyAgentPayload(payload, { callerLabel: cleaned, callerMeta: "typed" });
-    agentBusy = false;
-    setListeningState(
-      listenStream ? "Listening" : "Idle",
-      listenStream ? "Speak naturally, or type the next line." : "Start the call to speak, or keep typing.",
-    );
+    completeTurnRequest(request, payload);
   } catch (error) {
-    pending.remove();
+    if (!isCurrentRequest(request)) return;
+    request.pending?.remove(); activeTurnRequest = null; agentBusy = false;
     addTranscript("agent", error.message, "error");
-    agentBusy = false;
-    setListeningState("Error", "The typed turn failed. Try again.");
+    setListeningState("Error", "The message failed. Try again.");
   }
 }
 
@@ -1064,7 +1130,7 @@ function vadLoop() {
   if (bargeProbe || (bargeRecordingCandidate && !agentSpeaking)) {
     // The microphone and recorder stay live while the speech check runs.
     // No energy-based decision is allowed to pause output here.
-  } else if (agentSpeaking && !muted) {
+  } else if (agentSpeaking) {
     const bargeHit = rawLevel > limit.barge;
     if (bargeHit) {
       lastBargeHitAt = now;
@@ -1074,7 +1140,7 @@ function vadLoop() {
         appendRuntimeEvent("barge_in.candidate");
       }
     }
-  } else if (!agentBusy && !muted) {
+  } else if ((!agentBusy || activeTurnRequest)) {
     if (!recorder && now <= listenCooldownUntil) {
       if (audioMode === "headset" && rawLevel > limit.start * 1.05 && smoothedLevel > limit.start * 1.05) {
         // Headphones: allow speaking through a short post-playback hold.
@@ -1087,7 +1153,13 @@ function vadLoop() {
     } else if (!recorder) {
       // Capture the onset immediately; local classification decides whether
       // this is speech. Waiting for sustained energy clips brief initial words.
-      if (rawLevel > limit.start) startTurnRecording();
+      if (rawLevel > limit.start && startTurnRecording(Boolean(activeTurnRequest))) {
+        if (activeTurnRequest) {
+          bargeCandidateAt = now;
+          bargeRecordingCandidate = true;
+          appendRuntimeEvent("barge_in.processing_candidate");
+        }
+      }
     } else {
       turnMaxLevel = Math.max(turnMaxLevel, smoothedLevel);
       // Only fresh speech renews the endpoint clock. The old lower-energy
@@ -1139,8 +1211,8 @@ async function connectParticipant(identity, name) {
   return room;
 }
 
-async function prepareListener() {
-  listenStream = await navigator.mediaDevices.getUserMedia({
+async function prepareListener(epoch = callEpoch) {
+  const nextStream = await navigator.mediaDevices.getUserMedia({
     audio: {
       echoCancellation: { ideal: true },
       noiseSuppression: { ideal: true },
@@ -1149,6 +1221,8 @@ async function prepareListener() {
       channelCount: 1,
     },
   });
+  if (epoch !== callEpoch) { nextStream.getTracks().forEach(track => track.stop()); assertCallEpoch(epoch); }
+  listenStream = nextStream;
   // Constraints are requests, not proof that the device enabled processing.
   const captureTrack = listenStream.getAudioTracks()[0];
   const capabilities = captureTrack.getCapabilities?.() || {};
@@ -1177,61 +1251,98 @@ async function prepareListener() {
   analyser = audioContext.createAnalyser();
   analyser.fftSize = 1024;
   source.connect(analyser);
+  if (audioContext.audioWorklet && typeof AudioWorkletNode !== "undefined") {
+    try {
+      await audioContext.audioWorklet.addModule("/web/pcm_worklet.js");
+      assertCallEpoch(epoch);
+      pcmCapture = new PcmCapture(audioContext.sampleRate);
+      pcmNode = new AudioWorkletNode(audioContext, "aurora-pcm");
+      const capture = pcmCapture;
+      pcmNode.port.onmessage = (event) => capture.accept(event.data);
+      source.connect(pcmNode);
+      pcmNode.connect(audioContext.destination);
+      appendRuntimeEvent("audio.pre_roll | 300ms PCM");
+    } catch (error) {
+      if (error.name === "AbortError") throw error;
+      appendRuntimeEvent("audio.pre_roll | recorder fallback");
+    }
+  }
+  assertCallEpoch(epoch);
   setListeningState("Calibrating", "Measuring the room noise floor.");
   vadFrame = requestAnimationFrame(vadLoop);
   await new Promise((resolve) => setTimeout(resolve, 650));
+  assertCallEpoch(epoch);
   setListeningState("Listening", "Speak naturally. Aurora can be interrupted while talking.");
+}
+
+function assertCallEpoch(epoch) {
+  if (epoch !== callEpoch) {
+    const error = new Error("Call ended");
+    error.name = "AbortError";
+    throw error;
+  }
 }
 
 async function startCall() {
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
     throw new Error("This browser does not support the required audio APIs.");
   }
+  const epoch = ++callEpoch;
+  await cancelPendingTurn("call_started");
+  assertCallEpoch(epoch);
+  stopAgentPlayback();
+  sessionId = `browser-${crypto.randomUUID()}`;
+  lastOutputReference = currentRecordingReference = null;
+  playbackEndedAt = 0;
+  playbackReferenceHoldUntil = 0;
+  requestGeneration = 0;
+  const request = beginTurnRequest("greeting");
   setCallControls(true);
-  agentBusy = true;
-  callerStatus.textContent = "Connecting";
-  agentStatus.textContent = "Connecting";
+  callerStatus.textContent = agentStatus.textContent = "Connecting";
   await fetch("/reset", { method: "POST", headers: { "X-Session-ID": sessionId } });
-  agentRoom = await connectParticipant("aurora-agent", "Aurora Agent");
+  assertCallEpoch(epoch);
+  const nextAgent = await connectParticipant("aurora-agent", "Aurora Agent");
+  if (epoch !== callEpoch) { nextAgent.disconnect(); assertCallEpoch(epoch); }
+  agentRoom = nextAgent;
   agentStatus.textContent = "Connected";
-  await prepareListener();
-  callerRoom = await connectParticipant("caller-demo", "Caller");
+  await prepareListener(epoch);
+  assertCallEpoch(epoch);
+  const nextCaller = await connectParticipant("caller-demo", "Caller");
+  if (epoch !== callEpoch) { nextCaller.disconnect(); assertCallEpoch(epoch); }
+  callerRoom = nextCaller;
   await callerRoom.localParticipant.publishTrack(listenStream.getAudioTracks()[0], {
-    source: Track.Source.Microphone,
-    name: "caller-microphone",
+    source: Track.Source.Microphone, name: "caller-microphone",
   });
+  assertCallEpoch(epoch);
   callerStatus.textContent = "Connected";
+  if (!isCurrentRequest(request)) return;
   try {
-    const greetingResponse = await fetch("/greeting", {
-      method: "POST",
-      headers: { "X-Session-ID": sessionId },
-    });
-    const greeting = await greetingResponse.json();
-    if (!greetingResponse.ok) throw new Error(greeting.error || "Greeting failed");
-    const ttsMeta = ttsLabel(greeting);
-    providerEl.textContent = `Provider: ${greeting.provider} | ${greeting.model} | ${ttsMeta}`;
-    agentBusy = false;
-    speak(
-      greeting.reply,
-      greeting.locale || "en-US",
-      greeting.audioBase64 || "",
-      greeting.audioContentType || "audio/wav",
-    );
+    const response = await fetch("/greeting", { method: "POST", signal: request.controller.signal,
+      headers: { "X-Session-ID": request.sessionId } });
+    const greeting = await response.json();
+    if (!isCurrentRequest(request)) return;
+    if (!response.ok) throw new Error(greeting.error || "Greeting failed");
+    completeTurnRequest(request, greeting);
   } catch (error) {
-    agentBusy = false;
+    if (!isCurrentRequest(request)) return;
+    completeTurnRequest(request, { reply: "Thanks for calling Aurora Hotel reservations. How can I help?",
+      locale: "en-US", ttsBackend: "browser" });
     appendRuntimeEvent("tts.greeting_fallback | browser");
-    speak("Thanks for calling Aurora Hotel reservations. How can I help?", "en-US");
   }
 }
 
 async function endCall() {
   if (vadFrame) cancelAnimationFrame(vadFrame);
   vadFrame = null;
+  callEpoch++;
+  cancelPendingTurn("call_ended");
   lastVadFrameAt = 0;
   lastVadAudioTime = null;
   lastVadAudioAdvanceAt = 0;
   stopTurnRecording(true);
   stopAgentPlayback();
+  lastOutputReference = currentRecordingReference = null;
+  playbackReferenceHoldUntil = 0;
   agentSpeaking = false;
   agentBusy = false;
   bargeRecordingCandidate = false;
@@ -1240,6 +1351,10 @@ async function endCall() {
   clientEvents.length = 0;
   listenStream?.getTracks().forEach((track) => track.stop());
   listenStream = null;
+  pcmNode?.disconnect();
+  if (pcmNode) pcmNode.port.onmessage = null;
+  pcmNode = null;
+  pcmCapture?.close(); pcmCapture = null;
   if (audioContext) await audioContext.close();
   audioContext = null;
   analyser = null;
@@ -1253,26 +1368,6 @@ async function endCall() {
   agentStatus.textContent = "Waiting";
   setListeningState("Idle", "Start the call, then speak naturally");
   setCallControls(false);
-}
-
-async function toggleMute() {
-  muted = !muted;
-  if (muted) {
-    rejectBargeProbe("muted");
-    // Normal caller recordings need the same discard as preview candidates.
-    // Otherwise VAD stops evaluating their endpoint while muted, leaving an
-    // open recorder that can merge speech from before and after the mute.
-    stopTurnRecording(true);
-    if (suspendedPlayback && !agentBusy) {
-      resumeSuspendedPlayback("muted");
-    }
-  }
-  listenStream?.getAudioTracks().forEach((track) => { track.enabled = !muted; });
-  muteButton.textContent = muted ? "Unmute" : "Mute";
-  callerStatus.textContent = muted ? "Muted" : "Connected";
-  setListeningState(muted ? "Muted" : "Listening", muted
-    ? "Microphone input is paused."
-    : "Speak naturally. Aurora can be interrupted while talking.");
 }
 
 async function loadState() {
@@ -1320,27 +1415,16 @@ function unlockAudioOutput() {
 startButton.addEventListener("click", () => {
   unlockAudioOutput();
   startCall().catch(async (error) => {
+    if (error.name === "AbortError") return;
     await endCall();
     appendRuntimeEvent(`call.connection_failed | ${error.message}`);
     setListeningState("Connection failed", error.message);
   });
 });
-interruptButton?.addEventListener("click", () => forceInterrupt());
-document.addEventListener("keydown", (event) => {
-  if (event.code !== "Space" || event.repeat) return;
-  const tag = (event.target && event.target.tagName) || "";
-  if (tag === "INPUT" || tag === "TEXTAREA" || event.target?.isContentEditable) return;
-  if (!agentSpeaking) return;
-  event.preventDefault();
-  forceInterrupt();
-});
-muteButton.addEventListener("click", () => toggleMute().catch((error) => {
-  setListeningState("Mute failed", error.message);
-}));
 endButton.addEventListener("click", () => endCall());
 
 setCallControls(false);
-applyAudioMode(audioModeControl?.value || "speaker");
+applyAudioMode(audioModeControl?.value || "auto");
 loadState();
 
 /** Workshop/demo hooks for endpoint silence checks (FDE-228). */
@@ -1356,12 +1440,15 @@ window.__auroraTalk = {
   clientEvents: () => [...clientEvents],
   state: () => ({
     listening: listeningStateEl?.textContent || "",
-    muted,
     agentSpeaking,
     agentBusy,
     endpointMs: tuning.endpointSilenceMs,
     noiseFloor,
     trigger: thresholds().start,
+    audioMode,
+    captureMode: pcmCapture ? "pcm-pre-roll" : "media-recorder",
+    activeRequest: activeTurnRequest?.kind || null,
+    requestGeneration,
     playbackBackend,
     bargeProbe: Boolean(bargeProbe),
     playbackSuspended: Boolean(suspendedPlayback),
@@ -1396,7 +1483,10 @@ window.__auroraTalk = {
   speakDemo(text, locale = "en-US") {
     speak(text, locale);
   },
-  forceInterrupt() {
-    forceInterrupt();
-  },
 };
+
+navigator.mediaDevices?.addEventListener?.("devicechange", () => {
+  if (!listenStream) return;
+  if (recorder) recalibrateAfterTurn = true;
+  else resetListeningCalibration("device_change");
+});
