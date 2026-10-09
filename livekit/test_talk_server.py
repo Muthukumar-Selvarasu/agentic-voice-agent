@@ -638,5 +638,78 @@ class HostedConfigTests(unittest.TestCase):
             self.assertEqual(hosted_config_errors(), [])
 
 
+class LanguageAwareSttTests(unittest.TestCase):
+    def test_stt_receives_active_session_language_and_tamil_prompt(self):
+        fake_client = Mock()
+        fake_client.audio.transcriptions.create.return_value = "வணக்கம்"
+
+        class DummyProvider:
+            stt_model = "whisper-large-v3-turbo"
+            client = fake_client
+
+            def get_stt_prompt(self, language):
+                return "தமிழ் ஹோட்டல் முன்பதிவு"
+
+        dummy_agent = SimpleNamespace(
+            current_language="ta",
+            current_locale="ta-IN",
+            provider=DummyProvider(),
+            last_sources=[],
+            respond=lambda transcript, trace=None: ("பதில்", None),
+        )
+
+        with patch("talk_server._get_session", return_value=(dummy_agent, threading.Lock())):
+            with patch("talk_server._speech_evidence", return_value={"maxSpeechProbability": 0.9, "speechThreshold": 0.3}):
+                with patch("talk_server._browser_tts_payload", return_value={"ttsBackend": "browser"}):
+                    # 16-bit mono wav audio
+                    buffer = BytesIO()
+                    with wave.open(buffer, "wb") as wav_file:
+                        wav_file.setnchannels(1)
+                        wav_file.setsampwidth(2)
+                        wav_file.setframerate(16000)
+                        wav_file.writeframes(b"\x00\x00" * 3200)
+                    audio_data = buffer.getvalue()
+
+                    response = _voice_agent_reply(
+                        audio=audio_data,
+                        content_type="audio/wav",
+                        session_id="test-session-ta",
+                        turn_id="turn-1",
+                        was_barge_in=False,
+                    )
+
+        call_kwargs = fake_client.audio.transcriptions.create.call_args.kwargs
+        self.assertEqual(call_kwargs.get("language"), "ta")
+        self.assertEqual(call_kwargs.get("prompt"), "தமிழ் ஹோட்டல் முன்பதிவு")
+        self.assertEqual(response["transcript"], "வணக்கம்")
+
+
+class VerbalizeTtsTests(unittest.TestCase):
+    def test_verbalize_tamil_iso_dates_and_codes_and_currency(self):
+        from talk_server import _verbalize_for_tts
+
+        input_text = "முன்பதிவு AH-4827 உறுதிப்படுத்தப்பட்டது. தேதி 2026-08-12 முதல் 2026-08-18 வரை. கட்டணம் $24."
+        verbalized = _verbalize_for_tts(input_text, "ta-IN")
+        self.assertIn("A H 4 8 2 7", verbalized)
+        self.assertIn("ஆகஸ்ட் 12, 2026", verbalized)
+        self.assertIn("ஆகஸ்ட் 18, 2026", verbalized)
+        self.assertIn("24 டாலர்", verbalized)
+        self.assertNotIn("2026-08-12", verbalized)
+        self.assertNotIn("AH-4827", verbalized)
+
+    def test_verbalize_english_and_spanish(self):
+        from talk_server import _verbalize_for_tts
+
+        en_text = _verbalize_for_tts("Confirmed AH-4827 from 2026-08-12 to 2026-08-18 at $189.", "en-US")
+        self.assertIn("August 12, 2026", en_text)
+        self.assertIn("A H 4 8 2 7", en_text)
+        self.assertIn("189 dollars", en_text)
+
+        es_text = _verbalize_for_tts("Confirmado AH-4827 del 2026-08-12 por $229.", "es-ES")
+        self.assertIn("12 de agosto de 2026", es_text)
+        self.assertIn("A H 4 8 2 7", es_text)
+        self.assertIn("229 dólares", es_text)
+
+
 if __name__ == "__main__":
     unittest.main()

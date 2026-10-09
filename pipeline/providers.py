@@ -44,11 +44,32 @@ PRESETS = {
 }
 
 DEFAULT_STT_PROMPT = (
-    "Aurora Hotel reservations conversation in English or Spanish. "
-    "Hotel vocabulary: reservation, booking, check-in, check-out, cancellation policy, "
-    "pet policy, parking, breakfast, accessibility, habitación, reserva, política de "
-    "cancelación, mascotas, estacionamiento, desayuno, accesibilidad."
+    "Aurora Hotel reservations conversation in English, Spanish, or Tamil. "
+    "Hotel vocabulary: Standard Queen, Deluxe King, Harbor Suite, Family Double Queen, "
+    "Accessible Queen, reservation, booking, check-in, check-out, cancellation policy, "
+    "pet policy, parking, breakfast, buffet, confirmation number, "
+    "habitación, reserva, política de cancelación, mascotas, estacionamiento, desayuno, "
+    "முன்பதிவு, அறை, நன்றி, காலை உணவு."
 )
+
+STT_PROMPTS = {
+    "en": (
+        "Aurora Hotel reservations conversation in English. "
+        "Hotel vocabulary: Standard Queen, Deluxe King, Harbor Suite, Family Double Queen, "
+        "Accessible Queen, reservation, booking, check-in, check-out, cancellation policy, "
+        "pet policy, parking, breakfast, buffet, confirmation number."
+    ),
+    "es": (
+        "Conversación de reservas del Hotel Aurora en español. "
+        "Vocabulario: Standard Queen, Deluxe King, Harbor Suite, habitación, reserva, "
+        "check-in, check-out, política de cancelación, mascotas, estacionamiento, desayuno, accesibilidad."
+    ),
+    "ta": (
+        "Aurora Hotel reservations conversation in Tamil. "
+        "ஹோட்டல் முன்பதிவு உரையாடல்: முன்பதிவு, அறை, ஸ்டாண்டர்ட் குயின், டீலக்ஸ் கிங், "
+        "ஹார்பர் சூட், செக்-இன், செக்-அவுட், காலை உணவு, பஃபேட், ரத்து கொள்கை, உறுதிப்படுத்தல் எண், நன்றி."
+    ),
+}
 
 
 def _env_or_default(key: str, default: str) -> str:
@@ -132,8 +153,13 @@ class Provider:
                 return _mk_tool(forced, args)
             raise
 
+    def get_stt_prompt(self, language: str = "en") -> str:
+        if os.getenv("STT_PROMPT"):
+            return self.stt_prompt
+        return STT_PROMPTS.get(language, self.stt_prompt)
+
     # --- STT ---
-    def transcribe(self, pcm_int16: bytes, sample_rate: int = 16000) -> str:
+    def transcribe(self, pcm_int16: bytes, sample_rate: int = 16000, language: str | None = None) -> str:
         """Transcribe raw 16-bit mono PCM via Whisper."""
         wav = _pcm_to_wav(pcm_int16, sample_rate)
         wav.name = "turn.wav"  # SDK infers format from the filename
@@ -142,8 +168,11 @@ class Provider:
             "file": wav,
             "response_format": "text",
         }
-        if self.stt_prompt:
-            transcription_args["prompt"] = self.stt_prompt
+        if language in ("en", "es", "ta"):
+            transcription_args["language"] = language
+        prompt = self.get_stt_prompt(language or "en")
+        if prompt:
+            transcription_args["prompt"] = prompt
         resp = self.client.audio.transcriptions.create(
             **transcription_args,
         )

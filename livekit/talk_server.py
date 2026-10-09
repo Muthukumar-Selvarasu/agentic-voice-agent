@@ -348,6 +348,59 @@ def _finish_response(agent, trace, reply: str, action: str | None, **extra) -> d
     }
 
 
+_MONTHS_TA = {
+    1: "ஜனவரி", 2: "பிப்ரவரி", 3: "மார்ச்", 4: "ஏப்ரல்", 5: "மே", 6: "ஜூன்",
+    7: "ஜூலை", 8: "ஆகஸ்ட்", 9: "செப்டம்பர்", 10: "அக்டோபர்", 11: "நவம்பர்", 12: "டிசம்பர்",
+}
+_MONTHS_EN = {
+    1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
+    7: "July", 8: "August", 9: "September", 10: "October", 11: "November", 12: "December",
+}
+_MONTHS_ES = {
+    1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo", 6: "junio",
+    7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre",
+}
+
+
+def _verbalize_for_tts(text: str, locale: str = "en-US") -> str:
+    """Normalize written text into natural spoken forms for TTS (dates, codes, currency)."""
+    lang = locale.split("-")[0].lower()
+
+    # 1. ISO dates: YYYY-MM-DD -> spoken month, day, year
+    def _replace_date(match):
+        year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        if 1 <= month <= 12:
+            if lang == "ta":
+                return f"{_MONTHS_TA[month]} {day}, {year}"
+            elif lang == "es":
+                return f"{day} de {_MONTHS_ES[month]} de {year}"
+            else:
+                return f"{_MONTHS_EN[month]} {day}, {year}"
+        return match.group(0)
+
+    text = re.sub(r"\b(\d{4})-(\d{2})-(\d{2})\b", _replace_date, text)
+
+    # 2. Confirmation/reservation codes like AH-4827 -> A H 4 8 2 7
+    def _replace_code(match):
+        letters = " ".join(match.group(1))
+        digits = " ".join(match.group(2))
+        return f"{letters} {digits}"
+
+    text = re.sub(r"\b([A-Z]{2,4})-(\d{3,6})\b", _replace_code, text)
+
+    # 3. Currency symbols: $24 -> 24 dollars / 24 dólares / 24 டாலர்
+    if lang == "ta":
+        text = re.sub(r"\$(\d+(?:\.\d+)?)", r"\1 டாலர்", text)
+        # Detach hyphenated Tamil grammatical suffixes from times/numbers (e.g. 3PM-இல் -> 3 PM இல்)
+        text = re.sub(r"(\d+)\s*(AM|PM)-([அ-ஹ]+)", r"\1 \2 \3", text, flags=re.IGNORECASE)
+    elif lang == "es":
+        text = re.sub(r"\$(\d+(?:\.\d+)?)", r"\1 dólares", text)
+    else:
+        text = re.sub(r"\$(\d+(?:\.\d+)?)", r"\1 dollars", text)
+
+    return text
+
+
 def _system_tts_audio(text: str, locale: str) -> tuple[bytes, str] | None:
     """Render the configured macOS system voice without playing it on the host.
 
@@ -360,13 +413,14 @@ def _system_tts_audio(text: str, locale: str) -> tuple[bytes, str] | None:
     command = shutil.which(os.getenv("SYSTEM_TTS_CMD", "say"))
     if not command:
         return None
+    spoken_text = _verbalize_for_tts(text, locale)
     voice = {"en": "Samantha", "es": "Mónica", "ta": "Vani"}.get(locale.split("-")[0], "Samantha")
     with tempfile.TemporaryDirectory(prefix="aurora-system-tts-") as directory:
         output = Path(directory) / "speech.wav"
         subprocess.run(
             [command, "-v", voice, "-r", "176", "-o", str(output),
              "--file-format=WAVE", "--data-format=LEI16@24000"],
-            input=text, text=True, capture_output=True, check=True, timeout=20,
+            input=spoken_text, text=True, capture_output=True, check=True, timeout=20,
         )
         with wave.open(str(output)) as recording:
             if recording.getnframes() == 0:
@@ -591,7 +645,8 @@ def _voice_agent_reply(
             audio_file.name = "caller.ogg"
         else:
             audio_file.name = "caller.webm"
-        with trace.span("stt", model=getattr(agent.provider, "stt_model", "unknown")):
+        current_lang = getattr(agent, "current_language", "en") or "en"
+        with trace.span("stt", model=getattr(agent.provider, "stt_model", "unknown"), language=current_lang):
             transcription_args = {
                 "model": agent.provider.stt_model,
                 "file": audio_file,
@@ -599,7 +654,12 @@ def _voice_agent_reply(
                 # changing the configured model. Other STT APIs keep text.
                 "response_format": "verbose_json" if agent.provider.stt_model.startswith("whisper-") else "text",
             }
-            stt_prompt = getattr(agent.provider, "stt_prompt", "")
+            if current_lang in ("en", "es", "ta"):
+                transcription_args["language"] = current_lang
+            if hasattr(agent.provider, "get_stt_prompt"):
+                stt_prompt = agent.provider.get_stt_prompt(current_lang)
+            else:
+                stt_prompt = getattr(agent.provider, "stt_prompt", "")
             if stt_prompt:
                 transcription_args["prompt"] = stt_prompt
             stt = agent.provider.client.audio.transcriptions.create(**transcription_args)
