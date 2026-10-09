@@ -51,7 +51,7 @@ function browser({ provider = false, response = null, decodedChannels = null, de
   };
   const audios = [];
   class FakeAudio {
-    constructor() { this.currentTime = 0; this.paused = true; this.position = 17; this.pauseCount = 0; this.playCount = 0; audios.push(this); }
+    constructor() { this.currentTime = 0; this.paused = true; this.position = 17; this.pauseCount = 0; this.playCount = 0; this.volume = 1; audios.push(this); }
     play() { this.paused = false; this.playCount++; this.onplay?.(); return Promise.resolve(); }
     pause() { this.paused = true; this.pauseCount++; }
     removeAttribute() {}
@@ -74,6 +74,7 @@ function browser({ provider = false, response = null, decodedChannels = null, de
     clearTimeout(id) { timers.delete(id); },
   };
   const context = vm.createContext({
+    console,
     document, window, navigator: { mediaDevices: { addEventListener(name, callback) { deviceListeners.set(name, callback); } } }, Audio: FakeAudio, MediaRecorder: FakeRecorder,
     SpeechSynthesisUtterance: class { constructor(text) { this.text = text; } },
     Blob, Float32Array, URLSearchParams, Event: class {},
@@ -113,6 +114,7 @@ function browser({ provider = false, response = null, decodedChannels = null, de
     },
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'web/pcm_capture.js'), 'utf8').replace('export class', 'class'), context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'web/listen_gate.js'), 'utf8').replace(/export function/g, 'function'), context);
   vm.runInContext(script, context, { filename: 'talk.js' });
   const run = (code) => vm.runInContext(code, context);
   run(`listenStream = { getTracks: () => [], getAudioTracks: () => [{ getSettings: () => ({ echoCancellation: true }) }] };
@@ -804,3 +806,59 @@ test('recording keeps the actual playback reference after replacement and throug
   assert.equal(app.run('currentRecordingReference'), null);
   assert.equal(app.run('lastOutputReference'), null);
 });
+
+test('a suppressed voice turn updates the listening state with clear user feedback', async () => {
+  const app = browser({
+    response: { ignored: true, ignoreReason: 'probable_playback_echo', transcript: 'Wait' },
+  });
+  app.frame(40, .02);
+  frames(app, 30, .02);
+  frames(app, 70, 0);
+  await flush();
+  await flush();
+  await flush();
+  assert.ok(app.run("listeningStateEl?.textContent").includes("Listening"));
+  assert.ok(app.run("voiceStatusEl?.textContent").includes("speaker echo"));
+});
+
+test('caller microphone onset ducks active playback volume immediately', async () => {
+  const app = browser({ provider: true, audioMode: 'auto' });
+  app.start();
+  const audio = app.audios[0];
+  assert.equal(audio.paused, false);
+  const initialVolume = audio.volume;
+  frames(app, 3, 0.035);
+  await flush();
+  assert.ok(app.events().includes('barge_in.ducked'));
+  assert.ok(audio.volume < initialVolume);
+  assert.ok(audio.volume <= 0.1);
+});
+
+test('persistent caller energy confirms interruption locally within 200ms and pauses output', async () => {
+  const app = browser({ provider: true, audioMode: 'auto' });
+  app.start();
+  const audio = app.audios[0];
+  assert.equal(audio.paused, false);
+  frames(app, 8, 0.035);
+  await flush();
+  assert.ok(app.events().some((e) => e.startsWith('barge_in.speech_confirmed')));
+  assert.equal(audio.paused, true);
+  assert.equal(app.run('agentSpeaking'), false);
+});
+
+test('receding microphone energy restores ducked playback volume', async () => {
+  const app = browser({ provider: true, audioMode: 'auto' });
+  app.start();
+  const audio = app.audios[0];
+  const initialVolume = audio.volume;
+  frames(app, 3, 0.035);
+  await flush();
+  assert.ok(app.events().includes('barge_in.ducked'));
+  // Energy drops back to room baseline (speaker echo fell with duck)
+  frames(app, 4, 0.005);
+  await flush();
+  assert.ok(app.events().includes('barge_in.duck_restored'));
+  assert.equal(audio.volume, initialVolume);
+  assert.equal(audio.paused, false);
+});
+

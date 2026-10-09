@@ -1,5 +1,6 @@
 import { Room, Track } from "/node_modules/livekit-client/dist/livekit-client.esm.mjs";
 import { PcmCapture } from "/web/pcm_capture.js";
+import { createListenGate, stepListenGate, resetListenGate } from "/web/listen_gate.js";
 
 const callerRoot = document.querySelector('[data-client="caller"]');
 const agentRoot = document.querySelector('[data-client="agent"]');
@@ -85,6 +86,29 @@ let bargeRetryAt = 0;
 let bargeRetryCount = 0;
 let currentBargeTimings = null;
 const clientEvents = [];
+let listenGateState = createListenGate(0.02);
+let preDuckVolume = null;
+let duckFailed = false;
+
+function listenGateOptions(now, rawLevel) {
+  const isHeadset = audioMode === "headset";
+  return {
+    now,
+    level: rawLevel,
+    playbackAgeMs: playbackStartedAt !== null ? Math.max(0, now - playbackStartedAt) : 0,
+    audible: Boolean(agentSpeaking),
+    armMs: isHeadset ? 60 : (tuning.bargeInArmMs || 140),
+    multiple: isHeadset ? 1.15 : (tuning.bargeEchoMultiple || 1.35),
+    margin: isHeadset ? 0.003 : 0.005,
+    cap: isHeadset ? 0.14 : 0.22,
+    settleMs: isHeadset ? 50 : 80,
+    confirmMs: isHeadset ? 60 : (tuning.bargeInConfirmationMs || 80),
+    preDuckMs: isHeadset ? 30 : 50,
+    duckAvailable: Boolean(activeAgentAudio && !activeAgentAudio.paused),
+    refractoryMs: isHeadset ? 150 : 250,
+    duckFailed: Boolean(duckFailed),
+  };
+}
 
 const tuning = {
   endpointSilenceMs: Number(endpointControl?.value || 1000),
@@ -330,15 +354,31 @@ function completeTurnRequest(request, payload) {
     return;
   }
   request.pending?.remove();
-  request.placeholder?.remove();
   activeTurnRequest = null;
   agentBusy = false;
   if (payload.ignored) {
     appendRuntimeEvent(`audio.suppressed | ${payload.ignoreReason}`);
-    if (request.wasBargeIn && resumeSuspendedPlayback(payload.ignoreReason)) return;
-    setListeningState(listenStream ? "Listening" : "Idle", "Speak naturally, or send a message.");
+    if (request.wasBargeIn && resumeSuspendedPlayback(payload.ignoreReason)) {
+      request.placeholder?.remove();
+      return;
+    }
+    if (request.placeholder) {
+      if (payload.transcript) {
+        const body = request.placeholder.querySelector(".turn-body");
+        if (body) body.textContent = payload.transcript;
+        const meta = request.placeholder.querySelector(".turn-meta");
+        if (meta) meta.textContent = "Filtered as echo";
+      } else {
+        request.placeholder.remove();
+      }
+    }
+    const message = payload.ignoreReason === "probable_playback_echo"
+      ? "Audio was filtered as speaker echo. Speak again."
+      : "No speech detected. Speak again or send a message.";
+    setListeningState(listenStream ? "Listening" : "Idle", message);
     return;
   }
+  request.placeholder?.remove();
   if (request.wasBargeIn && request.detectedAt) commitBargeIn(request.detectedAt);
   applyAgentPayload(payload, { callerLabel: payload.transcript || request.text || "",
     callerMeta: request.kind === "typed" ? "typed" : `STT: ${payload.sttModel}`,
@@ -393,6 +433,10 @@ function stopAgentPlayback() {
     window.speechSynthesis.cancel();
   }
   if (activeAgentAudio) {
+    if (preDuckVolume !== null) {
+      activeAgentAudio.volume = preDuckVolume;
+      preDuckVolume = null;
+    }
     activeAgentAudio.onplay = null;
     activeAgentAudio.onended = null;
     activeAgentAudio.onerror = null;
@@ -400,6 +444,7 @@ function stopAgentPlayback() {
     activeAgentAudio.removeAttribute("src");
     activeAgentAudio = null;
   }
+  resetListenGate(listenGateState, Math.max(0.01, noiseFloor || 0.02), Date.now());
   return feedback;
 }
 
@@ -420,6 +465,9 @@ function beginAgentPlayback(token, backend) {
   speechCandidateAt = 0;
   if (recorder) stopTurnRecording(true);
   if (activeAgentAudio) activeAgentAudio.volume = tuning.playbackVolume;
+  preDuckVolume = null;
+  duckFailed = false;
+  resetListenGate(listenGateState, Math.max(0.01, noiseFloor || 0.02), playbackStartedAt);
   appendRuntimeEvent(`tts.playback_started | ${backend}`);
   if (lastEndpointAt) {
     const firstAudioMs = Date.now() - lastEndpointAt;
@@ -442,6 +490,11 @@ function beginAgentPlayback(token, backend) {
 
 function finishAgentPlayback(token) {
   if (token !== playbackToken) return;
+  if (preDuckVolume !== null && activeAgentAudio) {
+    activeAgentAudio.volume = preDuckVolume;
+    preDuckVolume = null;
+  }
+  resetListenGate(listenGateState, Math.max(0.01, noiseFloor || 0.02), Date.now());
   rememberOutputReference();
   clearPlaybackWatchdog();
   playbackFeedback(activeOutput, "completed");
@@ -721,6 +774,46 @@ async function startBargeProbe(detectedAt) {
   }
 }
 
+async function confirmBargeInLocally(now, detectedAt) {
+  if (!agentSpeaking && !suspendedPlayback) return;
+  if (activeTurnRequest) {
+    await cancelPendingTurn("confirmed_caller");
+  }
+  await playbackFeedback(activeOutput, "interrupted", requestGeneration,
+    currentPlaybackPosition(activeOutput, activeAgentAudio));
+  bargeProbe = null;
+  bargeRecordingCandidate = false;
+  if (activeAgentAudio || window.speechSynthesis?.speaking) {
+    suspendedPlayback = {
+      token: playbackToken,
+      detectedAt,
+      startedAt: now,
+      echoLevel: smoothedLevel,
+      backend: playbackBackend,
+      audio: activeAgentAudio,
+      checking: false,
+      outputFinished: false,
+      capturedMs: recorder ? now - recordingStartedAt : 0,
+    };
+    playbackWatchdogRemainingMs = Math.max(1500, playbackWatchdogDeadline - Date.now());
+    clearPlaybackWatchdog();
+    if (activeAgentAudio) activeAgentAudio.pause();
+    else if ("speechSynthesis" in window) window.speechSynthesis.pause();
+  }
+  agentSpeaking = false;
+  agentRoot.classList.remove("speaking");
+  playbackEndedAt = Date.now();
+  listenCooldownUntil = 0;
+  pendingBargeDetectedAt = detectedAt;
+  currentTurnWasBargeIn = true;
+  if (!speechActivity?.available) lastSpeechAt = Date.now();
+  appendRuntimeEvent(`barge_in.speech_confirmed | ${Date.now() - detectedAt} ms`);
+  vadReadout.dataset.interruptionLatencyMs = String(Date.now() - detectedAt);
+  currentBargeTimings = { onsetToPauseMs: Date.now() - detectedAt };
+  vadReadout.dataset.lastBargeTimings = JSON.stringify(currentBargeTimings);
+  setListeningState("Caller speaking", "Listening for the end of the turn.");
+}
+
 function resumeSuspendedPlayback(reason) {
   const paused = suspendedPlayback;
   suspendedPlayback = null;
@@ -729,6 +822,11 @@ function resumeSuspendedPlayback(reason) {
   bargeCandidateAt = lastBargeHitAt = 0;
   bargeRecordingCandidate = false;
   if (!paused || paused.token !== playbackToken || !listenStream) return false;
+  if (preDuckVolume !== null && paused.audio) {
+    paused.audio.volume = preDuckVolume;
+    preDuckVolume = null;
+  }
+  resetListenGate(listenGateState, Math.max(0.01, noiseFloor || 0.02), Date.now());
   // Learn the rejected level so the same echo does not repeatedly pause output.
   if (audioMode === "speaker") playbackEchoPeak = Math.max(playbackEchoPeak, paused.echoLevel);
   agentSpeaking = true;
@@ -1131,6 +1229,35 @@ function vadLoop() {
     // The microphone and recorder stay live while the speech check runs.
     // No energy-based decision is allowed to pause output here.
   } else if (agentSpeaking) {
+    const gateOpts = listenGateOptions(now, rawLevel);
+    const gateDecision = stepListenGate(listenGateState, gateOpts);
+    if (gateDecision.action === "duck") {
+      if (activeAgentAudio && !activeAgentAudio.paused) {
+        if (preDuckVolume === null) preDuckVolume = activeAgentAudio.volume;
+        activeAgentAudio.volume = Math.max(0.05, preDuckVolume * 0.25);
+        appendRuntimeEvent("barge_in.ducked");
+      }
+      if (!recorder && startTurnRecording(true)) {
+        bargeCandidateAt = now;
+        bargeRecordingCandidate = true;
+        appendRuntimeEvent("barge_in.candidate");
+      }
+    } else if (gateDecision.action === "restore") {
+      if (preDuckVolume !== null) {
+        if (activeAgentAudio) activeAgentAudio.volume = preDuckVolume;
+        preDuckVolume = null;
+        appendRuntimeEvent("barge_in.duck_restored");
+      }
+    } else if (gateDecision.action === "confirm") {
+      if (activeAgentAudio && !activeAgentAudio.paused) {
+        if (preDuckVolume !== null) {
+          activeAgentAudio.volume = preDuckVolume;
+          preDuckVolume = null;
+        }
+        confirmBargeInLocally(now, bargeCandidateAt || now);
+      }
+    }
+
     const bargeHit = rawLevel > limit.barge;
     if (bargeHit) {
       lastBargeHitAt = now;
