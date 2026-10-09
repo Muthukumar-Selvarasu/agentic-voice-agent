@@ -86,10 +86,11 @@
         <div class="workspace-footer">
           <form id="typed-turn" class="typed-turn">
             <label>
-              <span class="eyebrow">Typed turn</span>
-              <input id="typed-turn-input" type="text" autocomplete="off" placeholder="Type if STT misses a line (e.g. நன்றி)" />
+              <span class="eyebrow">Message the agent</span>
+              <input id="typed-turn-input" type="text" autocomplete="off" aria-describedby="message-help" placeholder="Type your message" />
             </label>
             <button id="typed-turn-send" type="submit">Send</button>
+            <p id="message-help" class="message-help">Send a message to the agent in English, Spanish, or Tamil.</p>
           </form>
           <div class="sources-block">
             <p class="eyebrow">Grounding sources</p>
