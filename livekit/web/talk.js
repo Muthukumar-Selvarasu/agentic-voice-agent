@@ -67,6 +67,7 @@ let turnMaxLevel = 0;
 let audioMode = "auto";
 let currentTurnWasBargeIn = false;
 let currentTurnAfterPlayback = false;
+let interruptedAudiblePlayback = false;
 let activeAgentAudio = null;
 let playbackToken = 0;
 let playbackWatchdog = 0;
@@ -379,7 +380,7 @@ function completeTurnRequest(request, payload) {
     return;
   }
   request.placeholder?.remove();
-  if (request.wasBargeIn && request.detectedAt) commitBargeIn(request.detectedAt);
+  if (request.wasBargeIn && request.detectedAt && request.interruptedPlayback) commitBargeIn(request.detectedAt);
   applyAgentPayload(payload, { callerLabel: payload.transcript || request.text || "",
     callerMeta: request.kind === "typed" ? "typed" : `STT: ${payload.sttModel}`,
     turnId: request.turnId });
@@ -755,6 +756,7 @@ async function startBargeProbe(detectedAt) {
     playbackEndedAt = Date.now();
     listenCooldownUntil = 0;
     pendingBargeDetectedAt = detectedAt;
+    interruptedAudiblePlayback = Boolean(!probe.outputFinished && (probe.audio || window.speechSynthesis?.speaking));
     // The caller may already have finished while STT was in flight. Do not
     // restart the silence timer at the response time when acoustic evidence exists.
     if (!speechActivity?.available) lastSpeechAt = Date.now();
@@ -806,6 +808,7 @@ async function confirmBargeInLocally(now, detectedAt) {
   listenCooldownUntil = 0;
   pendingBargeDetectedAt = detectedAt;
   currentTurnWasBargeIn = true;
+  interruptedAudiblePlayback = Boolean(activeAgentAudio || window.speechSynthesis?.speaking);
   if (!speechActivity?.available) lastSpeechAt = Date.now();
   appendRuntimeEvent(`barge_in.speech_confirmed | ${Date.now() - detectedAt} ms`);
   vadReadout.dataset.interruptionLatencyMs = String(Date.now() - detectedAt);
@@ -821,6 +824,7 @@ function resumeSuspendedPlayback(reason) {
   pendingBargeDetectedAt = 0;
   bargeCandidateAt = lastBargeHitAt = 0;
   bargeRecordingCandidate = false;
+  interruptedAudiblePlayback = false;
   if (!paused || paused.token !== playbackToken || !listenStream) return false;
   if (preDuckVolume !== null && paused.audio) {
     paused.audio.volume = preDuckVolume;
@@ -1071,13 +1075,19 @@ async function sendAudioToAgent(audioBlob) {
   const afterPlayback = currentTurnAfterPlayback;
   const reference = currentRecordingReference;
   const detectedAt = pendingBargeDetectedAt;
+  const interruptedPlayback = Boolean(wasBargeIn && interruptedAudiblePlayback);
+  interruptedAudiblePlayback = false;
   const timing = { source: "voice", endpointAt: lastEndpointAt,
     endpointAfterLastSpeechMs: lastEndpointAt - lastSpeechAt,
     endpointMethod: speechActivity?.available ? "silero" : "energy" };
   const bargeTiming = currentBargeTimings;
   currentTurnWasBargeIn = currentTurnAfterPlayback = false;
+  if (activeTurnRequest) {
+    await cancelPendingTurn("superseded_by_voice");
+  }
   const request = beginTurnRequest("voice");
   request.wasBargeIn = wasBargeIn;
+  request.interruptedPlayback = interruptedPlayback;
   request.detectedAt = detectedAt;
   request.placeholder = addTranscript("caller", "Voice turn", "transcribing");
   request.pending = addTranscript("agent", "Processing turn", "Transcribing and preparing a reply");

@@ -862,3 +862,28 @@ test('receding microphone energy restores ducked playback volume', async () => {
   assert.equal(audio.paused, false);
 });
 
+test('new voice turn cancels an in-flight pending turn and sends discarded feedback', async () => {
+  const app = browser({ deferReply: true, audioMode: 'auto' });
+  app.start();
+  app.run("sendTextToAgent('Pending question')");
+  await flush();
+  assert.equal(app.run('agentBusy'), true);
+  const blob = new Blob([Buffer.alloc(1600)], { type: 'audio/wav' });
+  app.run('sendAudioToAgent(new Blob([new Uint8Array(1600)], { type: "audio/wav" }))');
+  await flush();
+  assert.ok(app.feedback.some(event => event.state === 'discarded'));
+  assert.ok(app.events().includes('turn.superseded | superseded_by_voice'));
+});
+
+test('post-playback normal turn does not display interruption chip', async () => {
+  const app = browser({ audioMode: 'auto' });
+  app.start();
+  app.run(`applyAgentPayload(${JSON.stringify({ ...acceptedReply, reply: "Room options" })})`);
+  await flush();
+  app.run('sendAudioToAgent(new Blob([new Uint8Array(1600)], { type: "audio/wav" }))');
+  await flush();
+  const children = app.run('transcriptEl.children');
+  assert.ok(!children.some(el => String(el.className).includes('interruption')));
+});
+
+

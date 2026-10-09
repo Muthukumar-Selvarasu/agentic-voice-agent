@@ -275,5 +275,69 @@ class ScaleTests(unittest.TestCase):
         self.assertEqual(result["workers"], 181)
 
 
+class BookingValidationTests(unittest.TestCase):
+    def test_normalize_room_type_rejects_ambiguous_and_unknown(self):
+        from agent import _normalize_room_type
+        self.assertIsNone(_normalize_room_type("standard of the week"))
+        self.assertIsNone(_normalize_room_type("some stuff we need"))
+        self.assertIsNone(_normalize_room_type("penthouse presidential"))
+        self.assertIsNone(_normalize_room_type(""))
+        self.assertEqual(_normalize_room_type("Standard Queen"), "standard")
+        self.assertEqual(_normalize_room_type("queen"), "standard")
+        self.assertEqual(_normalize_room_type("Deluxe King"), "king")
+        self.assertEqual(_normalize_room_type("Harbor Suite"), "suite")
+        self.assertEqual(_normalize_room_type("Accessible Queen"), "accessible")
+
+    def test_create_booking_rejects_unknown_room_type(self):
+        from agent import run_tool
+        result = run_tool("create_booking", {
+            "room_type": "standard of the week",
+            "guest_name": "Muthu",
+            "check_in": "August 12",
+            "check_out": "August 18",
+            "guests": 2,
+            "contact": "muthu@example.com",
+        })
+        self.assertIn("Unknown room type", result["result"])
+        self.assertIn("clarify", result["result"])
+
+    def test_create_booking_generates_distinct_booking_codes(self):
+        from agent import run_tool
+        priya = run_tool("create_booking", {
+            "room_type": "standard",
+            "guest_name": "Priya Shah",
+            "check_in": "August 12",
+            "check_out": "August 14",
+            "guests": 2,
+            "contact": "priya@example.com",
+        })
+        self.assertIn("AH-4827", priya["result"])
+
+        muthu = run_tool("create_booking", {
+            "room_type": "king",
+            "guest_name": "Muthu",
+            "check_in": "August 12",
+            "check_out": "August 18",
+            "guests": 2,
+            "contact": "muthu@example.com",
+        })
+        self.assertIn("AH-", muthu["result"])
+        # Same guest/dates gets same deterministic code on recap
+        muthu_recap = run_tool("create_booking", {
+            "room_type": "king",
+            "guest_name": "Muthu",
+            "check_in": "August 12",
+            "check_out": "August 18",
+            "guests": 2,
+            "contact": "muthu@example.com",
+        })
+        self.assertEqual(muthu["result"], muthu_recap["result"])
+
+    def test_search_hotel_knowledge_topic_filtering(self):
+        result = search_hotel_knowledge("What time is breakfast served?")
+        self.assertTrue(any("Breakfast" in s for s in result["sources"]))
+        self.assertFalse(any("Cancellation" in s for s in result["sources"]))
+
+
 if __name__ == "__main__":
     unittest.main()

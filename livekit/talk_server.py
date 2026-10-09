@@ -227,7 +227,7 @@ def _interrupted_playback_note(record: dict) -> str:
                 "Do not assume the caller heard the full reply or agreed to anything in it.]")
     return (f"[Playback note: Aurora's voice reply was interrupted at about {fraction:.0%} of its audio. "
             f"Approximate portion already spoken: {heard!r}. The caller may not have heard the rest. "
-            "Do not repeat the approximate portion unless asked, and do not assume the caller heard or agreed to the remainder.]")
+            "Do not repeat the approximate portion unless asked, do not resume or complete the unspoken remainder of this reply, and do not assume the caller heard or agreed to the remainder. Respond directly to the caller's newest input.]")
 
 
 def _apply_delivery_feedback(agent, session_id: str) -> None:

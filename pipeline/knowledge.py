@@ -141,11 +141,20 @@ def search_hotel_knowledge(query: str, limit: int = 3) -> dict:
             "result": "No grounded hotel policy was found. Offer a transfer to the front desk.",
             "sources": [],
         }
+    top_score = matches[0].get("score", 0)
+    if top_score < 0:
+        relevant_matches = [m for m in matches if m.get("score", 0) <= top_score * 0.5]
+    elif top_score > 0:
+        relevant_matches = [m for m in matches if m.get("score", 0) >= top_score * 0.5]
+    else:
+        relevant_matches = matches[:1]
+    if not relevant_matches:
+        relevant_matches = matches[:1]
     passages = [
         f"[{match['section']}] {match['text']}"
-        for match in matches
+        for match in relevant_matches
     ]
-    sources = [f"{match['source']}#{match['section']}" for match in matches]
+    sources = [f"{match['source']}#{match['section']}" for match in relevant_matches]
     return {
         "result": "Grounded hotel knowledge:\n" + "\n".join(passages),
         "sources": sources,
