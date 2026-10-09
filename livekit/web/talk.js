@@ -1517,14 +1517,14 @@ async function loadState() {
   }
 }
 
-endpointControl.addEventListener("input", () => {
+endpointControl?.addEventListener("input", () => {
   tuning.endpointSilenceMs = Number(endpointControl.value);
   endpointValue.textContent = `${tuning.endpointSilenceMs} ms`;
 });
 
-sensitivityControl.addEventListener("input", () => {
+sensitivityControl?.addEventListener("input", () => {
   tuning.sensitivity = Number(sensitivityControl.value);
-  sensitivityValue.textContent = `${tuning.sensitivity.toFixed(1)}x`;
+  if (sensitivityValue) sensitivityValue.textContent = `${tuning.sensitivity.toFixed(1)}x`;
   resetListeningCalibration("sensitivity");
 });
 
